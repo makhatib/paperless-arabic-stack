@@ -145,6 +145,9 @@ validate_port() {
 
 NONINTERACTIVE=0
 
+# `restore` dumps the database it is about to replace first, unless you say no.
+SAFETY_DUMP=1
+
 # ask VAR "question" "default"
 # If VAR already has a value (from .env or the environment) that value becomes
 # the default, which is what makes a re-run keep your previous answers.
@@ -342,7 +345,7 @@ banner() {
 ║         YouTube: youtube.com/@malkhatib                   ║
 ║         Website: malkhatib.com                            ║
 ║                                                           ║
-║   ─────────────────────────────────────────────────────    ║
+║   ────────────────────────────────────────────────────    ║
 ║                                                           ║
 ║   What you get:                                           ║
 ║   ✓ Paperless-ngx   — your document archive               ║
@@ -811,8 +814,30 @@ write_env() {
 
     if [[ $PAS_TARGET == vps ]]; then
         PAS_BASIC_AUTH_PASS=${PAS_BASIC_AUTH_PASS:-$(generate_secret 20)}
+
+        # The hash is DERIVED from the user + password, so it MUST be rebuilt
+        # whenever either of them changes. Editing .env and re-running is the
+        # documented way to change a setting; the first version only built the
+        # hash when it was empty, so after an edit the installer printed
+        # credentials that Traefik then rejected with 401, with no error.
+        # PAS_BASIC_AUTH_FP records which user/password the stored hash belongs
+        # to -- a salted hash cannot be compared against a password directly,
+        # and re-hashing on every run would churn compose.yaml.
+        local want_fp; want_fp=$(auth_fingerprint "$PAS_BASIC_AUTH_USER" "$PAS_BASIC_AUTH_PASS")
         if [[ -z ${PAS_BASIC_AUTH_HASH:-} ]]; then
             PAS_BASIC_AUTH_HASH=$(htpasswd_line "$PAS_BASIC_AUTH_USER" "$PAS_BASIC_AUTH_PASS")
+            PAS_BASIC_AUTH_FP=$want_fp
+        elif [[ -z ${PAS_BASIC_AUTH_FP:-} ]]; then
+            # An .env from an older installer has a hash but no marker, so there
+            # is no way to tell what it belongs to. Rebuild it once; from then
+            # on re-runs leave it alone.
+            print_info "Rebuilding the AI screen's password hash once, so it can be checked from now on."
+            PAS_BASIC_AUTH_HASH=$(htpasswd_line "$PAS_BASIC_AUTH_USER" "$PAS_BASIC_AUTH_PASS")
+            PAS_BASIC_AUTH_FP=$want_fp
+        elif [[ ${PAS_BASIC_AUTH_FP} != "$want_fp" ]]; then
+            print_info "The AI screen's username or password changed in .env — rebuilding its hash."
+            PAS_BASIC_AUTH_HASH=$(htpasswd_line "$PAS_BASIC_AUTH_USER" "$PAS_BASIC_AUTH_PASS")
+            PAS_BASIC_AUTH_FP=$want_fp
         fi
     fi
 
@@ -825,7 +850,7 @@ write_env() {
              PAS_AI_MODE PAS_OLLAMA_MODE PAS_OLLAMA_URL PAS_TEXT_MODEL PAS_VISION_MODEL PAS_GPU \
              PAS_CLOUD_PROVIDER PAS_CLOUD_BASE_URL PAS_CLOUD_MODEL \
              PAS_ADMIN_USER PAS_ADMIN_MAIL PAS_ADMIN_PASSWORD PAS_PUID PAS_PGID \
-             PAS_BASIC_AUTH_USER PAS_BASIC_AUTH_PASS PAS_BASIC_AUTH_HASH \
+             PAS_BASIC_AUTH_USER PAS_BASIC_AUTH_PASS PAS_BASIC_AUTH_HASH PAS_BASIC_AUTH_FP \
              PAPERLESS_SECRET_KEY PAPERLESS_DBPASS PAS_CLOUD_API_KEY; do
         env_set "$k" "${!k:-}"
     done
@@ -842,6 +867,21 @@ write_env() {
 
     load_env
     print_success "Settings and passwords written to .env (chmod 600, never commit this file)"
+}
+
+# Which user/password the stored basic-auth hash was built from. Not a secret
+# in its own right: .env already holds that password in clear text, next to it.
+# sha256sum (coreutils) or openssl is present on every supported system; the
+# last resort still changes whenever the user or password length changes.
+auth_fingerprint() {
+    local s="$1:$2"
+    if command_exists sha256sum; then
+        printf '%s' "$s" | sha256sum | cut -d' ' -f1
+    elif command_exists openssl; then
+        printf '%s' "$s" | openssl dgst -sha256 | awk '{print $NF}'
+    else
+        printf 'len-%d-%d' "${#1}" "${#2}"
+    fi
 }
 
 # A basic-auth line "user:hash" that Traefik accepts.
@@ -1544,6 +1584,36 @@ verify() {
         else
             print_warning "Traefik did not answer on port 80 yet."
         fi
+
+        # The basic-auth password is the one credential this installer prints
+        # that it does NOT get back from a running service, so test it for real
+        # instead of trusting the hash in .env. --resolve + -k keeps this on
+        # 127.0.0.1 and works before the certificate is issued. The header is
+        # built by hand on purpose: `curl -u` through a nested shell loses the
+        # credential and reports a false 401 (measured in review).
+        if [[ $PAS_AI_MODE != none && -n ${PAS_BASIC_AUTH_HASH:-} ]]; then
+            local ai_host="${PAS_AI_SUB}.${PAS_DOMAIN}" cred c_no c_yes
+            cred=$(printf '%s:%s' "$PAS_BASIC_AUTH_USER" "$PAS_BASIC_AUTH_PASS" | base64 | tr -d '\n')
+            c_no=$(curl -sk --max-time 8 -o /dev/null -w '%{http_code}' \
+                     --resolve "${ai_host}:443:127.0.0.1" "https://${ai_host}/" 2>/dev/null || true)
+            c_yes=$(curl -sk --max-time 8 -o /dev/null -w '%{http_code}' \
+                      -H "Authorization: Basic ${cred}" \
+                      --resolve "${ai_host}:443:127.0.0.1" "https://${ai_host}/" 2>/dev/null || true)
+            if [[ $c_no == 401 && $c_yes =~ ^(200|30[0-9])$ ]]; then
+                print_success "AI screen asks for the password (401) and the printed one works (HTTP $c_yes)"
+            elif [[ $c_yes == 401 ]]; then
+                print_error "The AI screen rejects the password this installer is about to print."
+                echo "      Delete the PAS_BASIC_AUTH_HASH line from .env and run ./install.sh again."
+                ok=0
+            elif [[ $c_no != 401 && $c_no =~ ^[0-9]{3}$ && $c_no != 000 ]]; then
+                print_error "The AI screen answered HTTP $c_no without any password — it is NOT protected."
+                ok=0
+            else
+                print_warning "Could not reach the AI screen through Traefik yet (got '$c_no'/'$c_yes')."
+                echo "      Normal if the certificate is still being issued. Re-check with ./install.sh status"
+            fi
+        fi
+
         print_info "Certificates take 1-3 minutes after the DNS records resolve. Watch them with:"
         echo "      docker compose logs -f traefik | grep -i acme"
     fi
@@ -1816,13 +1886,30 @@ cmd_update() {
 # backup / restore
 ################################################################################
 
-backup_db_only() {
-    mkdir -p "$BACKUP_DIR"
-    local f
-    f="$BACKUP_DIR/db-$(date +%Y%m%d-%H%M%S).sql.gz"
-    dc exec -T db pg_dump -U paperless -d paperless | gzip > "$f"
+# Row count of one table, or "" if the query failed (table or database missing).
+db_count() {
+    local n
+    n=$(dc exec -T db psql -tAq -U paperless -d paperless \
+            -c "SELECT count(*) FROM $1;" 2>/dev/null | tr -dc '0-9' || true)
+    printf '%s' "$n"
+}
+
+# Dump the live database to a .sql.gz. Returns non-zero (and leaves no file)
+# if pg_dump failed or produced nothing.
+dump_db_to() {
+    local f=$1
+    mkdir -p "$(dirname "$f")"
+    if ! { dc exec -T db pg_dump -U paperless -d paperless | gzip > "$f"; } 2>/dev/null; then
+        rm -f "$f"; return 1
+    fi
     [[ -s $f ]] || { rm -f "$f"; return 1; }
     chmod 600 "$f"
+}
+
+backup_db_only() {
+    local f
+    f="$BACKUP_DIR/db-$(date +%Y%m%d-%H%M%S).sql.gz"
+    dump_db_to "$f" || return 1
     print_success "Database backup: $f"
 }
 
@@ -1835,9 +1922,15 @@ cmd_backup() {
     local out="$BACKUP_DIR/paperless-ar-backup-${stamp}.tar.gz"
 
     print_step "1/4 Database..."
-    dc exec -T db pg_dump -U paperless -d paperless | gzip > "$work/db.sql.gz"
-    [[ -s $work/db.sql.gz ]] || { rm -rf "$work"; die "The database dump came out empty. Is the db container running?"; }
-    print_success "Database dumped ($(du -h "$work/db.sql.gz" | cut -f1))"
+    # The dump is a pipeline, so it has to be guarded explicitly: a bare
+    # `pg_dump | gzip` aborts through the ERR trap and the friendly message
+    # below is never reached.
+    local docs; docs=$(db_count documents_document)
+    if ! dump_db_to "$work/db.sql.gz"; then
+        rm -rf "$work"
+        die "The database dump failed or came out empty. Is the db container running?  ./install.sh status"
+    fi
+    print_success "Database dumped ($(du -h "$work/db.sql.gz" | cut -f1), ${docs:-?} documents)"
 
     print_step "2/4 Your documents (originals, archive PDFs, thumbnails)..."
     local v
@@ -1850,15 +1943,17 @@ cmd_backup() {
 
     print_step "3/4 Prompts, config and settings..."
     local -a extras=() item
-    for item in prompts config db compose.yaml .env INSTALLATION_INFO.txt; do
+    for item in prompts config db export compose.yaml .env INSTALLATION_INFO.txt; do
         [[ -e "$SCRIPT_DIR/$item" ]] && extras+=("$item")
     done
     tar czf "$work/files.tar.gz" -C "$SCRIPT_DIR" "${extras[@]}"
     print_success "files.tar.gz ($(du -h "$work/files.tar.gz" | cut -f1))"
 
     print_step "4/4 Packing..."
-    printf 'paperless-arabic-stack backup\ncreated=%s\ninstaller=%s\npaperless_ngx=%s\npaperless_gpt=%s\npostgres=%s\n' \
-        "$(date -Iseconds)" "$SCRIPT_VERSION" "$PAS_V_NGX" "${PAS_V_GPT:-none}" "$PAS_V_POSTGRES" > "$work/MANIFEST"
+    # documents= is load-bearing: restore compares it with what actually landed
+    # in the database, which is how a half-applied dump gets caught.
+    printf 'paperless-arabic-stack backup\ncreated=%s\ninstaller=%s\npaperless_ngx=%s\npaperless_gpt=%s\npostgres=%s\ndocuments=%s\n' \
+        "$(date -Iseconds)" "$SCRIPT_VERSION" "$PAS_V_NGX" "${PAS_V_GPT:-none}" "$PAS_V_POSTGRES" "${docs:-unknown}" > "$work/MANIFEST"
     tar czf "$out" -C "$work" MANIFEST db.sql.gz media.tar.gz data.tar.gz files.tar.gz
     chmod 600 "$out"
     rm -rf "$work"
@@ -1891,9 +1986,49 @@ cmd_restore() {
 
     local work; work=$(mktemp -d)
     tar xzf "$src" -C "$work" || { rm -rf "$work"; die "Could not read the backup archive."; }
+    [[ -f $work/db.sql.gz ]] || { rm -rf "$work"; die "There is no database dump (db.sql.gz) inside that archive."; }
+
+    # Everything below is checked BEFORE the live database is dropped. Restore is
+    # destructive, so an unusable archive has to be caught while the current
+    # install is still intact.
+    print_step "Checking the backup file is complete..."
+    gunzip -t "$work/db.sql.gz" 2>/dev/null \
+        || { rm -rf "$work"; die "The database dump inside that archive is damaged (gzip check failed). Nothing was changed."; }
+    # pg_dump 18 writes its end marker, then a "\unrestrict <token>" line, then
+    # possibly blank lines -- the marker is 5 lines from the end on this version.
+    # The window is deliberately wide: rejecting a GOOD backup because a future
+    # pg_dump added two trailing lines would be far worse than the bug this
+    # check exists to catch.
+    local dump_tail; dump_tail=$(gunzip -c "$work/db.sql.gz" | tail -20 || true)
+    if ! contains "$dump_tail" 'PostgreSQL database dump complete'; then
+        rm -rf "$work"
+        die "That dump is truncated — it has no end marker. The backup is incomplete. Nothing was changed."
+    fi
+    local want_docs; want_docs=$(sed -n 's/^documents=//p' "$work/MANIFEST" 2>/dev/null | tr -dc '0-9' || true)
+    print_success "Backup file is complete${want_docs:+ (${want_docs} documents in it)}"
 
     print_step "Stopping the applications (the database stays up)..."
     dc stop webserver paperless-gpt 2>/dev/null || true
+
+    # A safety dump of what is about to be destroyed. Without it a bad restore
+    # leaves nothing at all to go back to.
+    local safety=""
+    if (( SAFETY_DUMP )); then
+        print_step "Saving the CURRENT database first, in case this restore goes wrong..."
+        safety="$BACKUP_DIR/pre-restore-$(date +%Y%m%d-%H%M%S).sql.gz"
+        if dump_db_to "$safety"; then
+            print_success "Safety dump: $safety"
+        else
+            safety=""
+            print_error "Could not dump the current database. The db container is probably not running."
+            echo "  Start it first:  docker compose up -d db      (then run restore again)"
+            echo "  Or skip this safety net on purpose:  ./install.sh restore $src --no-safety-dump"
+            rm -rf "$work"
+            die "Stopping before anything is deleted."
+        fi
+    else
+        print_warning "--no-safety-dump: the current database will not be saved first."
+    fi
 
     print_step "Restoring the database..."
     # WITH (FORCE) kicks off any session still holding the database open; without
@@ -1902,8 +2037,64 @@ cmd_restore() {
         -c 'DROP DATABASE IF EXISTS paperless WITH (FORCE);' >/dev/null
     dc exec -T db psql -q -U paperless -d postgres \
         -c 'CREATE DATABASE paperless OWNER paperless;' >/dev/null
-    gunzip -c "$work/db.sql.gz" | dc exec -T db psql -q -U paperless -d paperless >/dev/null
-    print_success "Database restored"
+
+    # -v ON_ERROR_STOP=1 is the whole point of this block. Without it psql
+    # prints each failed statement, carries on, and still exits 0 -- so a
+    # truncated dump restored an EMPTY database and this script said
+    # "✓ Database restored". Measured: psql exits 0, psql -v ON_ERROR_STOP=1
+    # exits 3 on the same broken input.
+    local failed=""
+    if ! gunzip -c "$work/db.sql.gz" \
+         | dc exec -T db psql -q -v ON_ERROR_STOP=1 -U paperless -d paperless \
+             >"$work/restore.log" 2>&1; then
+        failed="psql stopped on an error while loading the dump"
+    fi
+
+    # Belt and braces: even a dump that loads without an error must end up with
+    # a usable database in it.
+    local got_docs="" got_users=""
+    if [[ -z $failed ]]; then
+        got_users=$(db_count auth_user)
+        got_docs=$(db_count documents_document)
+        if [[ -z $got_users || -z $got_docs ]]; then
+            failed="the restored database has no Paperless tables in it"
+        elif (( got_users == 0 )); then
+            failed="the restored database has no users in it"
+        elif [[ -n $want_docs && $got_docs != "$want_docs" ]]; then
+            failed="the backup holds $want_docs documents but only $got_docs were restored"
+        fi
+    fi
+
+    if [[ -n $failed ]]; then
+        echo
+        print_error "The restore FAILED: $failed."
+        echo "  Last lines from PostgreSQL:"
+        tail -n 15 "$work/restore.log" 2>/dev/null | sed 's/^/      /'
+        echo
+        if [[ -n $safety ]]; then
+            print_step "Putting your previous database back from the safety dump..."
+            dc exec -T db psql -q -U paperless -d postgres \
+                -c 'DROP DATABASE IF EXISTS paperless WITH (FORCE);' >/dev/null
+            dc exec -T db psql -q -U paperless -d postgres \
+                -c 'CREATE DATABASE paperless OWNER paperless;' >/dev/null
+            if gunzip -c "$safety" \
+                 | dc exec -T db psql -q -v ON_ERROR_STOP=1 -U paperless -d paperless >/dev/null 2>&1; then
+                print_success "Your previous database is back, and your documents were never touched."
+            else
+                print_error "The roll-back failed too. Your old database is still in this file:"
+                echo "      $safety"
+            fi
+        else
+            print_warning "There was no safety dump, so the old database is gone. Use another backup."
+        fi
+        dc up -d >/dev/null 2>&1 || true
+        local keep; keep="$BACKUP_DIR/failed-restore-$(date +%Y%m%d-%H%M%S).log"
+        cp -f "$work/restore.log" "$keep" 2>/dev/null && print_info "Full error log: $keep"
+        rm -rf "$work"
+        die "Stopped on purpose. Your documents and files were left alone."
+    fi
+
+    print_success "Database restored (${got_docs} documents, ${got_users} users) — checked, not assumed"
 
     print_step "Restoring your documents..."
     local v
@@ -1921,9 +2112,81 @@ cmd_restore() {
     rm -rf "$work"
     print_step "Starting back up..."
     dc up -d
+    reconcile_identity
     sleep 5
     dc ps
     print_success "Restore finished. Open your archive and check a document opens."
+    if [[ -n $safety ]]; then
+        print_info "The database you replaced is still saved here, delete it when you are happy:"
+        echo "      $safety"
+    fi
+}
+
+# A restored database carries the admin password and the API token from the
+# machine the backup came from, while .env still holds this machine's. Restoring
+# onto a fresh install (the actual disaster-recovery path) therefore printed an
+# admin password that did not work, and left paperless-gpt holding a dead token.
+# .env is the source of truth, so push both back into the database.
+reconcile_identity() {
+    print_step "Lining the admin password and API token up with .env..."
+
+    local tries=0
+    until dc exec -T webserver curl -fsS --max-time 3 http://localhost:8000 >/dev/null 2>&1; do
+        tries=$(( tries + 1 ))
+        if (( tries >= 60 )); then
+            print_warning "Paperless-ngx has not come back up yet, so the password was left as it is."
+            echo "      When it is up, run ./install.sh again to line them up."
+            return 0
+        fi
+        sleep 5
+    done
+
+    # The password goes in through the environment, never on the command line or
+    # inside the python source -- a password the user typed can contain quotes.
+    # Captured, not piped into `grep -q`: a quitting grep SIGPIPEs the exec and
+    # pipefail then reports 141 for a run that actually worked.
+    local pw_out
+    pw_out=$(dc exec -T -e PAS_PW="$PAS_ADMIN_PASSWORD" -e PAS_USER="$PAS_ADMIN_USER" \
+            webserver python3 /usr/src/paperless/src/manage.py shell -c '
+import os
+from django.contrib.auth import get_user_model
+U = get_user_model()
+u, _ = U.objects.get_or_create(username=os.environ["PAS_USER"])
+u.is_superuser = True
+u.is_staff = True
+u.set_password(os.environ["PAS_PW"])
+u.save()
+print("PAS_ADMIN_OK")
+' 2>/dev/null || true)
+    if contains "$pw_out" 'PAS_ADMIN_OK'; then
+        print_success "Admin '$PAS_ADMIN_USER' can log in with the password in .env"
+    else
+        print_warning "Could not reset the admin password. The backup's own password still works."
+    fi
+
+    if [[ $PAS_AI_MODE != none ]]; then
+        local token
+        token=$(dc exec -T webserver python3 /usr/src/paperless/src/manage.py shell -c '
+from rest_framework.authtoken.models import Token
+from django.contrib.auth import get_user_model
+u = get_user_model().objects.filter(is_superuser=True).order_by("id").first()
+if u is not None:
+    t, _ = Token.objects.get_or_create(user=u)
+    print("PAS_TOKEN=%s" % t.key)
+' 2>/dev/null | grep -oE 'PAS_TOKEN=[0-9a-f]{40}' | cut -d= -f2 || true)
+        if [[ -n $token ]]; then
+            if [[ $token != "${PAPERLESS_API_TOKEN:-}" ]]; then
+                env_set PAPERLESS_API_TOKEN "$token"
+                load_env
+                dc up -d paperless-gpt >/dev/null 2>&1 || true
+                print_success "API token taken from the restored database and given to Paperless-GPT"
+            else
+                print_success "API token still matches"
+            fi
+        else
+            print_warning "Could not read the API token back. Run ./install.sh to recreate it."
+        fi
+    fi
 }
 
 ################################################################################
@@ -1988,8 +2251,9 @@ Paperless Arabic Stack — installer $SCRIPT_VERSION
   ./install.sh help            this text
 
 Options:
-  --yes, -y        do not ask anything; use .env / PAS_* environment variables
-  --purge-data     with 'uninstall': also delete the data volumes (destructive)
+  --yes, -y          do not ask anything; use .env / PAS_* environment variables
+  --purge-data       with 'uninstall': also delete the data volumes (destructive)
+  --no-safety-dump   with 'restore': do not save the database being replaced
 
 Everything lives in this folder. Passwords are in ./.env (chmod 600).
 EOF
@@ -2005,6 +2269,7 @@ main() {
         case $1 in
             --yes|-y)     NONINTERACTIVE=1 ;;
             --purge-data) purge=1 ;;
+            --no-safety-dump) SAFETY_DUMP=0 ;;
             -h|--help)    usage; return 0 ;;
             --*)          usage; die "Unknown option: $1" ;;
             *)            if [[ -z $cmd ]]; then cmd=$1; else pos+=("$1"); fi ;;
@@ -2026,6 +2291,15 @@ main() {
                 if ! (( NONINTERACTIVE )); then
                     local a=""; read -r -p "${CYAN}Type ${BOLD}DELETE MY DATA${NC}${CYAN} to confirm: ${NC}" a || true
                     [[ $a == "DELETE MY DATA" ]] || { print_info "Cancelled."; exit 0; }
+                else
+                    # --purge-data --yes cannot ask, so give the one guard left:
+                    # a window to stop it. Every document, the database and the
+                    # downloaded models go, and nothing brings them back.
+                    print_warning "Every document, the database and the AI models will be deleted."
+                    echo "  ${RED}${BOLD}This cannot be undone.${NC}  Press Ctrl-C in the next 10 seconds to stop."
+                    local s
+                    for s in 10 9 8 7 6 5 4 3 2 1; do printf '\r  deleting in %2d ...' "$s"; sleep 1; done
+                    printf '\r                        \r'
                 fi
                 dc down -v --remove-orphans
                 print_success "Everything removed."

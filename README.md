@@ -158,6 +158,14 @@ To change models, edit `PAS_TEXT_MODEL` / `PAS_VISION_MODEL` in `.env` and run
 
 Add `--yes` to run without any questions, using the values already in `.env`.
 
+### Changing a setting later
+
+Edit `.env`, then run `./install.sh` again. It rewrites `compose.yaml` from your
+answers and restarts only what changed. Changing a password in `.env` is enough —
+for example `PAS_BASIC_AUTH_USER` or `PAS_BASIC_AUTH_PASS` (the AI screen's
+password box): the installer rebuilds the Traefik hash from the new values and then
+tests the credential against the running site before printing it to you.
+
 ### Updating to a newer release
 
 Image versions are **pinned** in `.env` (`PAS_V_NGX`, `PAS_V_GPT`, …) so that
@@ -175,13 +183,42 @@ nano .env                    # change PAS_V_NGX=3.3.0 to the version you want
 - a `pg_dump` of the database
 - the `media` volume (your original files, archived PDFs, thumbnails)
 - the `data` volume (search index, classifier model)
-- `prompts/`, `config/`, `db/`, `compose.yaml` and `.env`
+- `prompts/`, `config/`, `db/`, `export/`, `compose.yaml` and `.env`
+- a `MANIFEST` that records how many documents were in the database
 
 **The archive contains `.env`, which contains every password.** Keep it private, and
 copy it off the machine — a backup that only exists on the same server is not a backup.
 
+### Restoring
+
+```bash
+./install.sh restore backups/paperless-ar-backup-YYYYMMDD-HHMMSS.tar.gz
+```
+
+Restore replaces the database and all documents, so it checks the backup **before**
+it touches anything, and it refuses to pretend:
+
+1. the archive must unpack, and the dump inside it must be valid gzip and end with
+   PostgreSQL's own end-of-dump marker — a truncated or half-copied backup is
+   rejected while your install is still untouched;
+2. the current database is dumped to `backups/pre-restore-<timestamp>.sql.gz` first;
+3. the dump is loaded with `ON_ERROR_STOP=1`, so the first failed statement stops it
+   instead of being printed and skipped;
+4. afterwards the restored document count is compared with the `MANIFEST`. If it does
+   not match, the restore is treated as failed.
+
+If any of that fails, the previous database is put back from the safety dump, the
+error log is kept in `backups/failed-restore-<timestamp>.log`, your documents are
+left alone, and the command exits non-zero. `--no-safety-dump` skips step 2 if you
+really want to.
+
+**Restoring onto a different machine** works: install normally first
+(`./install.sh`), then restore. The admin password and the API token in your `.env`
+are pushed back into the restored database at the end, so the password the installer
+printed you is the one that works and Paperless-GPT keeps talking to Paperless-ngx.
+
 Test your restore. `./install.sh restore <file>` is there for exactly that, and we
-test it on every release of this script.
+test it on every release of this script — including with deliberately broken backups.
 
 ---
 
@@ -347,6 +384,13 @@ different way of counting.)
 `backup` → delete a document → `restore` was run as a real drill, not just
 configured. Four consecutive `./install.sh` runs complete successfully and the
 last two generate a byte-identical `compose.yaml`.
+
+`restore` was also run against three **deliberately broken** backups — a
+truncated dump, a dump that errors half way through, and a dump that loads
+cleanly but is missing the documents. All three are refused, the previous
+database is put back, and the command exits non-zero. That matters because the
+first version of this script printed "✓ Database restored" and left an empty
+archive behind.
 
 What could **not** be tested in that lab: issuing a real Let's Encrypt
 certificate, because the test machine cannot receive an inbound connection on

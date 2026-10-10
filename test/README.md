@@ -121,6 +121,58 @@ Take a backup, delete a document through the API, restore, and confirm the
 document comes back **with its AI-corrected text** and that the original file is
 still downloadable. A backup nobody has restored is not a backup.
 
+Note that Paperless **soft-deletes**: `DELETE /api/documents/<id>/` only moves the
+document to the trash, and the row stays in `documents_document` with a
+`deleted_at`. To make a document really disappear (and make the drill mean
+something) empty the trash too:
+
+```bash
+curl -fsS -X POST -H "Authorization: Token $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"action":"empty","documents":[1]}' http://localhost:8000/api/trash/
+```
+
+### Does a BROKEN backup get refused?
+This is the important one. `psql` exits **0** when statements fail, so without
+`ON_ERROR_STOP=1` a half-applied dump restores an empty database and the script
+reports success. Prove the three guards, starting from a good backup `$GOOD`:
+
+```bash
+# 1. truncated dump -> refused before anything is dropped
+mkdir -p /root/wk && tar xzf "$GOOD" -C /root/wk && cd /root/wk
+N=$(gunzip -c db.sql.gz | wc -l)
+gunzip -c db.sql.gz | head -n $((N*40/100)) | gzip > t && mv t db.sql.gz
+tar czf /root/pas/backups/T1-TRUNCATED.tar.gz MANIFEST db.sql.gz media.tar.gz data.tar.gz files.tar.gz
+
+# 2. complete dump that errors half way -> refused, previous DB rolled back
+gunzip -c db.sql.gz | awk '/^CREATE TABLE public.documents_document /&&!d{
+  print "INSERT INTO public.table_that_does_not_exist VALUES (1);"; d=1} {print}' | gzip > db.sql.gz
+
+# 3. loads cleanly but the documents are missing -> caught by the MANIFEST count
+gunzip -c db.sql.gz | awk '/^COPY public.documents_document /{print;s=1;next}
+  s&&$0=="\\."{print;s=0;next} s{next} {print}' | gzip > db.sql.gz
+```
+
+For each one: `./install.sh restore <file> --yes` must exit **non-zero**, print
+`✗ The restore FAILED: …`, and leave the document count exactly as it was.
+
+### Is the printed basic-auth password the one that works?
+Change it in `.env` and re-run — this is a path viewers take, and it used to
+print credentials Traefik rejected:
+
+```bash
+docker exec pas-test sh -c 'cd /root/pas &&
+  sed -i "s/^PAS_BASIC_AUTH_USER=.*/PAS_BASIC_AUTH_USER=\x27mahmoud\x27/" .env &&
+  ./install.sh --yes | grep -A3 "second, separate password"'
+```
+
+The compose label must now read `basicauth.users=mahmoud:…`, the new user must get
+`200` and the old one `401`. `verify()` tests this itself on every VPS install, so
+the install output already tells you: *"AI screen asks for the password (401) and
+the printed one works (HTTP 200)"*. To drill the failure branch, replace
+`PAS_BASIC_AUTH_HASH` in `.env` with a hash of a different password while leaving
+`PAS_BASIC_AUTH_FP` alone — the installer should then report that the AI screen
+rejects the password it is about to print.
+
 ## What cannot be tested this way
 
 Issuing a real Let's Encrypt certificate, because the target cannot receive an
