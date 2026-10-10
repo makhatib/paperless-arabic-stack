@@ -241,8 +241,14 @@ Test your restore. `./install.sh restore <file>` is there for exactly that, and 
 test it on every release of this script — including with deliberately broken backups.
 
 Each restore leaves a `pre-restore-*.sql.gz` behind, and each failed one a
-`failed-restore-*.log`. Nothing prunes them. Both can contain your data, so keep
-`backups/` private and delete the old ones once you are happy.
+`failed-restore-*.log`. Both can contain your data, so keep `backups/` private.
+
+Each restore keeps the newest 5 of each of those two and deletes the older ones,
+so restore drills cannot quietly fill the disk with database dumps. Set
+`PAS_BACKUP_KEEP=<n>` in `.env` to keep a different number, or
+`PAS_BACKUP_KEEP=0` to never delete anything. The backups you make yourself —
+`db-*.sql.gz` and `paperless-ar-backup-*.tar.gz` — are never deleted, whatever
+`PAS_BACKUP_KEEP` says.
 
 ---
 
