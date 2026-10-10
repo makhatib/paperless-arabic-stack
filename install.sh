@@ -165,6 +165,17 @@ SAFETY_DUMP=1
 # it. Only --reset-admin-password (or answering yes to the prompt) writes it.
 RESET_ADMIN_PW=0
 
+# What the live database says about the password in .env, filled in by verify()
+# from pw_probe(): PAS_PW_MATCH / PAS_PW_DIFFERS / PAS_PW_NOUSER, or empty when
+# we could not ask. summary() refuses to print a password this does not confirm.
+#
+# A re-run after the user changes their own password in Paperless leaves .env
+# holding the install-time value, and the install path correctly does NOT
+# overwrite it -- so .env is simply out of date. Printing it anyway put a dead
+# password on screen (and on camera). The probe already existed for `restore`;
+# the install path just never asked.
+PAS_PW_STATE=""
+
 # ask VAR "question" "default"
 # If VAR already has a value (from .env or the environment) that value becomes
 # the default, which is what makes a re-run keep your previous answers.
@@ -1549,6 +1560,35 @@ verify() {
 
     if dc exec -T webserver curl -fsS --max-time 5 http://localhost:8000 >/dev/null 2>&1; then
         print_success "Paperless-ngx answers on its own port"
+
+        # Ask the database whether the password in .env is actually the login,
+        # instead of printing it and hoping. PAS_PW_DIFFERS is NOT a failure --
+        # it means the user changed their own password, which is exactly what
+        # they should do after seeing it on screen -- so `ok` is left alone.
+        PAS_PW_STATE=$(pw_probe)
+        case $PAS_PW_STATE in
+            PAS_PW_MATCH)
+                print_success "Admin '$PAS_ADMIN_USER' can log in with the password in .env"
+                ;;
+            PAS_PW_DIFFERS)
+                print_info "Admin '$PAS_ADMIN_USER' uses a password you set yourself — .env is out of date."
+                echo "      Nothing was changed. Your own password is still the login."
+                ;;
+            PAS_PW_NOUSER)
+                # Paperless-ngx only creates the superuser from the environment
+                # on a FIRST boot into an empty database, so this means that
+                # boot did not happen here. Printing the .env password would be
+                # pointing at an account that does not exist.
+                print_error "There is no user called '$PAS_ADMIN_USER' in the database."
+                echo "      Look for it:  docker compose logs webserver | grep -i superuser"
+                echo "      Create it by hand:"
+                echo "      docker compose exec webserver python3 /usr/src/paperless/src/manage.py createsuperuser"
+                ok=0
+                ;;
+            *)
+                print_warning "Could not check the admin password against the database."
+                ;;
+        esac
     else
         print_error "Paperless-ngx is not answering"; ok=0
     fi
@@ -1681,14 +1721,34 @@ summary() {
 
     echo "${CYAN}${BOLD}Login${NC}"
     printf '  Username: %s\n' "$PAS_ADMIN_USER"
-    printf '  Password: %s%s%s\n' "$BOLD" "$PAS_ADMIN_PASSWORD" "$NC"
+    # Only print a password the database confirmed. verify() asked; if it came
+    # back PAS_PW_DIFFERS the user changed it themselves and .env is stale, so
+    # the value here would be a password that does not log in.
+    case $PAS_PW_STATE in
+        PAS_PW_DIFFERS)
+            printf '  Password: %syou changed this yourself%s\n' "$BOLD" "$NC"
+            echo "            Your own password is the live one. The value in .env is out of date."
+            ;;
+        PAS_PW_NOUSER)
+            printf '  Password: %s—%s  (there is no %s user yet, see the error above)\n' \
+                "$BOLD" "$NC" "$PAS_ADMIN_USER"
+            ;;
+        *)
+            printf '  Password: %s%s%s\n' "$BOLD" "$PAS_ADMIN_PASSWORD" "$NC"
+            ;;
+    esac
     if [[ $PAS_TARGET == vps && $PAS_AI_MODE != none ]]; then
         echo
         echo "  The AI screen asks for a second, separate password first:"
         printf '  Username: %s\n' "$PAS_BASIC_AUTH_USER"
         printf '  Password: %s%s%s\n' "$BOLD" "$PAS_BASIC_AUTH_PASS" "$NC"
     fi
-    echo "  ${YELLOW}All of this is also saved in ./.env — keep that file safe and never commit it.${NC}"
+    if [[ $PAS_PW_STATE == PAS_PW_DIFFERS ]]; then
+        echo "  ${YELLOW}./.env still holds the original install password — it is no longer the login.${NC}"
+        echo "  ${YELLOW}Keep that file safe anyway: the other secrets in it are current.${NC}"
+    else
+        echo "  ${YELLOW}All of this is also saved in ./.env — keep that file safe and never commit it.${NC}"
+    fi
     echo
 
     if [[ $PAS_AI_MODE != none ]]; then
@@ -1833,6 +1893,13 @@ cmd_status() {
     print_step "Health checks"
     if dc exec -T webserver curl -fsS --max-time 5 http://localhost:8000 >/dev/null 2>&1; then
         print_success "Paperless-ngx: answering"
+        # Same question verify() asks, so `status` does not point at .env for a
+        # password that stopped being the login.
+        case "$(pw_probe)" in
+            PAS_PW_MATCH)   print_success "Admin password: the one in .env works" ;;
+            PAS_PW_DIFFERS) print_info    "Admin password: you changed it yourself — .env is out of date" ;;
+            PAS_PW_NOUSER)  print_error   "Admin password: there is no '$PAS_ADMIN_USER' user" ;;
+        esac
     else
         print_error "Paperless-ngx: NOT answering"
     fi
@@ -2139,6 +2206,10 @@ cmd_restore() {
             print_info "Full error log (keep it private, it can quote database rows): $keep"
         fi
         rm -rf "$work"
+        # Rotate before dying: this is the path that generates the log files,
+        # so it is the path that most needs to not pile them up. $safety and
+        # $keep are this run's, and are protected.
+        prune_restore_leftovers "$safety" "$keep"
         die "Stopped on purpose. Your documents and files were left alone."
     fi
 
@@ -2168,6 +2239,55 @@ cmd_restore() {
         print_info "The database you replaced is still saved here, delete it when you are happy:"
         echo "      $safety"
     fi
+    prune_restore_leftovers "$safety"
+}
+
+# Keep only the newest $PAS_BACKUP_KEEP of the files restore leaves behind by
+# itself, and delete nothing else.
+#
+# Scope is the whole point here. backups/ holds four kinds of file and only two
+# of them are ours to delete:
+#   KEPT ALWAYS  db-*.sql.gz, paperless-ar-backup-*.tar.gz
+#                -- the user ran a command to make these. Never touched.
+#   ROTATED      pre-restore-*.sql.gz, failed-restore-*.log
+#                -- side effects of a restore the user never asked for. These
+#                   are what pile up: every drill leaves one of each.
+# The two patterns rotate independently, so a run of failed restores cannot
+# push out the safety dumps. The file the current run just wrote is passed in
+# as $2 and is never a candidate, however small PAS_BACKUP_KEEP is.
+#
+# Timestamped -%Y%m%d-%H%M%S names sort lexically in time order, so `sort`
+# is the age ordering -- no mtime parsing, and no `ls` output to split.
+prune_backups() {
+    local pattern=$1 just_written=${2:-} keep=${PAS_BACKUP_KEEP:-5}
+    [[ $keep =~ ^[0-9]+$ ]] || return 0
+    (( keep == 0 )) && return 0          # 0 disables rotation entirely
+
+    local -a found=()
+    local f
+    # Globs, not `find`/`ls`: a literal unmatched glob is the only case to skip.
+    for f in "$BACKUP_DIR"/$pattern; do
+        [[ -f $f ]] || continue
+        [[ -n $just_written && $f == "$just_written" ]] && continue
+        found+=("$f")
+    done
+    (( ${#found[@]} > keep )) || return 0
+
+    local -a sorted=()
+    mapfile -t sorted < <(printf '%s\n' "${found[@]}" | sort)
+    local n_del=$(( ${#sorted[@]} - keep ))
+    local deleted=0
+    for f in "${sorted[@]:0:$n_del}"; do
+        rm -f -- "$f" 2>/dev/null && deleted=$(( deleted + 1 ))
+    done
+    (( deleted )) && print_info "Removed $deleted old $pattern (kept the newest $keep)."
+    return 0
+}
+
+# Both restore byproducts, after the run that created them is finished.
+prune_restore_leftovers() {
+    prune_backups 'pre-restore-*.sql.gz'   "${1:-}"
+    prune_backups 'failed-restore-*.log'   "${2:-}"
 }
 
 # Does the password in .env actually log in? Prints exactly one of
@@ -2380,8 +2500,13 @@ Options:
                      the backup contains (which is your own).
 
 Everything lives in this folder. Passwords are in ./.env (chmod 600).
-'backups/' also collects pre-restore-*.sql.gz and failed-restore-*.log from
-restore drills. Nothing prunes them — delete the old ones when you are happy.
+
+'backups/' also collects two files that a restore leaves behind by itself:
+pre-restore-*.sql.gz (the database it replaced) and failed-restore-*.log. Each
+restore keeps the newest 5 of each and deletes older ones. Change that with
+PAS_BACKUP_KEEP=<n> in .env, or PAS_BACKUP_KEEP=0 to never delete anything.
+The backups you make yourself — db-*.sql.gz and paperless-ar-backup-*.tar.gz —
+are never deleted, whatever PAS_BACKUP_KEEP says.
 EOF
 }
 
