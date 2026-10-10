@@ -208,17 +208,41 @@ it touches anything, and it refuses to pretend:
    not match, the restore is treated as failed.
 
 If any of that fails, the previous database is put back from the safety dump, the
-error log is kept in `backups/failed-restore-<timestamp>.log`, your documents are
-left alone, and the command exits non-zero. `--no-safety-dump` skips step 2 if you
-really want to.
+error log is kept in `backups/failed-restore-<timestamp>.log` (mode `600` — it can
+quote rows out of the database), your documents are left alone, and the command exits
+non-zero. `--no-safety-dump` skips step 2 if you really want to.
 
-**Restoring onto a different machine** works: install normally first
-(`./install.sh`), then restore. The admin password and the API token in your `.env`
-are pushed back into the restored database at the end, so the password the installer
-printed you is the one that works and Paperless-GPT keeps talking to Paperless-ngx.
+#### Your password after a restore
+
+**A restore never changes your admin password.** If you changed it inside Paperless
+— and you should, especially if the installer's output was ever on screen in front
+of anyone — your backup holds the password you chose, and that is the password you
+log in with afterwards. The installer says so, and warns that `PAS_ADMIN_PASSWORD`
+in `.env` is then out of date.
+
+If you have genuinely lost that password, you can overwrite it with the one in
+`.env`:
+
+```bash
+./install.sh restore <file> --reset-admin-password
+```
+
+Interactively it just asks, and the default answer is **no**.
+
+The API token is different and is lined up automatically: the token lives in the
+database, so after a restore the new one is copied into `.env` and Paperless-GPT is
+restarted with it. No copy/paste, and nothing of yours is overwritten.
+
+**Restoring onto a different machine** therefore works: install normally first
+(`./install.sh`), then restore, then log in with the password from the machine the
+backup came from — or add `--reset-admin-password` if that password is gone.
 
 Test your restore. `./install.sh restore <file>` is there for exactly that, and we
 test it on every release of this script — including with deliberately broken backups.
+
+Each restore leaves a `pre-restore-*.sql.gz` behind, and each failed one a
+`failed-restore-*.log`. Nothing prunes them. Both can contain your data, so keep
+`backups/` private and delete the old ones once you are happy.
 
 ---
 

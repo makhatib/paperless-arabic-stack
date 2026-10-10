@@ -117,6 +117,18 @@ generate_secret() {
 # into it; under `pipefail` a successful match then reports 141. Everywhere we
 # need "does this output contain X", capture first and match against a string.
 contains() { grep -qE -- "$2" <<<"$1"; }
+
+# Blanks out anything that looks like credential material on its way to the
+# screen: Django password hashes (pbkdf2_sha256$...), the apr1 basic-auth hash,
+# and 40-hex API tokens. Used on PostgreSQL error text, which quotes the row it
+# choked on -- and a dump broken inside the auth_user table puts the admin's
+# password hash in that row. Measured.
+redact_secrets() {
+    sed -E \
+        -e 's/(pbkdf2_[a-z0-9]+|argon2|bcrypt[a-z0-9_]*|scrypt|sha1|md5|unsalted_[a-z0-9]+)\$[^[:space:]"'"'"']*/\1$<redacted>/g' \
+        -e 's/\$apr1\$[^[:space:]"'"'"']*/$apr1$<redacted>/g' \
+        -e 's/[0-9a-f]{40}/<redacted>/g'
+}
 contains_line() { grep -qxF -- "$2" <<<"$1"; }
 
 validate_domain() {
@@ -147,6 +159,11 @@ NONINTERACTIVE=0
 
 # `restore` dumps the database it is about to replace first, unless you say no.
 SAFETY_DUMP=1
+
+# `restore` never silently overwrites the admin password in the restored
+# database -- that password is the user's, and the backup is the right place for
+# it. Only --reset-admin-password (or answering yes to the prompt) writes it.
+RESET_ADMIN_PW=0
 
 # ask VAR "question" "default"
 # If VAR already has a value (from .env or the environment) that value becomes
@@ -275,7 +292,24 @@ have_port_tool() { command_exists ss || command_exists netstat; }
 # the token can only be created after paperless-ngx is already running. Feed
 # compose a placeholder until the real token exists. It is never written to
 # .env, and paperless-gpt is not started during those phases.
+# Every docker compose call gets </dev/null, because `docker compose` attaches
+# and DRAINS our stdin even when nothing inside the container reads it. That ate
+# the operator's answer to the restore prompt: with the answer piped in,
+# `printf 'restore\ny\n' | ./install.sh restore <file>` took the default-no
+# branch every single time, and no amount of fixing the prompt helped. It is not
+# only `exec -T` -- `dc stop` / `dc up -d` do it too, so it is fixed here once
+# rather than at thirty call sites.
+#
+# The two calls that really are fed something on stdin (loading a dump into
+# psql) use dc_in instead.
 dc() {
+    if [[ -z ${PAPERLESS_API_TOKEN:-} ]]; then
+        PAPERLESS_API_TOKEN="pending-install" docker compose "$@" </dev/null
+    else
+        docker compose "$@" </dev/null
+    fi
+}
+dc_in() {
     if [[ -z ${PAPERLESS_API_TOKEN:-} ]]; then
         PAPERLESS_API_TOKEN="pending-install" docker compose "$@"
     else
@@ -2045,7 +2079,7 @@ cmd_restore() {
     # exits 3 on the same broken input.
     local failed=""
     if ! gunzip -c "$work/db.sql.gz" \
-         | dc exec -T db psql -q -v ON_ERROR_STOP=1 -U paperless -d paperless \
+         | dc_in exec -T db psql -q -v ON_ERROR_STOP=1 -U paperless -d paperless \
              >"$work/restore.log" 2>&1; then
         failed="psql stopped on an error while loading the dump"
     fi
@@ -2068,8 +2102,17 @@ cmd_restore() {
     if [[ -n $failed ]]; then
         echo
         print_error "The restore FAILED: $failed."
-        echo "  Last lines from PostgreSQL:"
-        tail -n 15 "$work/restore.log" 2>/dev/null | sed 's/^/      /'
+        # Only the ERROR: lines go on screen. psql also prints a CONTEXT: line
+        # that quotes the WHOLE offending row, and when the dump is broken
+        # inside the auth_user table that row contains the admin's password
+        # hash -- it was being printed to the terminal. ERROR: lines are
+        # redacted too, because a bad column value can be credential material.
+        local shown
+        shown=$(grep -E 'ERROR:' "$work/restore.log" 2>/dev/null | redact_secrets | tail -n 8 || true)
+        if [[ -n $shown ]]; then
+            echo "  What PostgreSQL complained about:"
+            sed 's/^/      /' <<<"$shown"
+        fi
         echo
         if [[ -n $safety ]]; then
             print_step "Putting your previous database back from the safety dump..."
@@ -2078,7 +2121,7 @@ cmd_restore() {
             dc exec -T db psql -q -U paperless -d postgres \
                 -c 'CREATE DATABASE paperless OWNER paperless;' >/dev/null
             if gunzip -c "$safety" \
-                 | dc exec -T db psql -q -v ON_ERROR_STOP=1 -U paperless -d paperless >/dev/null 2>&1; then
+                 | dc_in exec -T db psql -q -v ON_ERROR_STOP=1 -U paperless -d paperless >/dev/null 2>&1; then
                 print_success "Your previous database is back, and your documents were never touched."
             else
                 print_error "The roll-back failed too. Your old database is still in this file:"
@@ -2088,8 +2131,13 @@ cmd_restore() {
             print_warning "There was no safety dump, so the old database is gone. Use another backup."
         fi
         dc up -d >/dev/null 2>&1 || true
+        # 600, like everything else in backups/: this file holds the full psql
+        # output, which can contain rows out of auth_user and authtoken_token.
         local keep; keep="$BACKUP_DIR/failed-restore-$(date +%Y%m%d-%H%M%S).log"
-        cp -f "$work/restore.log" "$keep" 2>/dev/null && print_info "Full error log: $keep"
+        if ( umask 077 && cp -f "$work/restore.log" "$keep" ) 2>/dev/null; then
+            chmod 600 "$keep" 2>/dev/null || true
+            print_info "Full error log (keep it private, it can quote database rows): $keep"
+        fi
         rm -rf "$work"
         die "Stopped on purpose. Your documents and files were left alone."
     fi
@@ -2122,31 +2170,34 @@ cmd_restore() {
     fi
 }
 
-# A restored database carries the admin password and the API token from the
-# machine the backup came from, while .env still holds this machine's. Restoring
-# onto a fresh install (the actual disaster-recovery path) therefore printed an
-# admin password that did not work, and left paperless-gpt holding a dead token.
-# .env is the source of truth, so push both back into the database.
-reconcile_identity() {
-    print_step "Lining the admin password and API token up with .env..."
+# Does the password in .env actually log in? Prints exactly one of
+# PAS_PW_MATCH / PAS_PW_DIFFERS / PAS_PW_NOUSER, or nothing if it could not ask.
+#
+# The password goes in through the environment, never on the command line or
+# inside the python source -- a password the user typed can contain quotes.
+# Captured, not piped into `grep -q`: a quitting grep SIGPIPEs the exec and
+# pipefail then reports 141 for a run that actually worked. For the same reason
+# there is no `head -1`/`grep -m1` here.
+pw_probe() {
+    dc exec -T -e PAS_PW="$PAS_ADMIN_PASSWORD" -e PAS_USER="$PAS_ADMIN_USER" \
+        webserver python3 /usr/src/paperless/src/manage.py shell -c '
+import os
+from django.contrib.auth import get_user_model
+u = get_user_model().objects.filter(username=os.environ["PAS_USER"]).first()
+if u is None:
+    print("PAS_PW_NOUSER")
+elif u.check_password(os.environ["PAS_PW"]):
+    print("PAS_PW_MATCH")
+else:
+    print("PAS_PW_DIFFERS")
+' 2>/dev/null | grep -oE 'PAS_PW_(MATCH|DIFFERS|NOUSER)' || true
+}
 
-    local tries=0
-    until dc exec -T webserver curl -fsS --max-time 3 http://localhost:8000 >/dev/null 2>&1; do
-        tries=$(( tries + 1 ))
-        if (( tries >= 60 )); then
-            print_warning "Paperless-ngx has not come back up yet, so the password was left as it is."
-            echo "      When it is up, run ./install.sh again to line them up."
-            return 0
-        fi
-        sleep 5
-    done
-
-    # The password goes in through the environment, never on the command line or
-    # inside the python source -- a password the user typed can contain quotes.
-    # Captured, not piped into `grep -q`: a quitting grep SIGPIPEs the exec and
-    # pipefail then reports 141 for a run that actually worked.
-    local pw_out
-    pw_out=$(dc exec -T -e PAS_PW="$PAS_ADMIN_PASSWORD" -e PAS_USER="$PAS_ADMIN_USER" \
+# Writes .env's password into the database. Only ever called with the user's
+# explicit say-so (--reset-admin-password, the prompt, or a missing user).
+set_admin_pw() {
+    local out
+    out=$(dc exec -T -e PAS_PW="$PAS_ADMIN_PASSWORD" -e PAS_USER="$PAS_ADMIN_USER" \
             webserver python3 /usr/src/paperless/src/manage.py shell -c '
 import os
 from django.contrib.auth import get_user_model
@@ -2158,11 +2209,80 @@ u.set_password(os.environ["PAS_PW"])
 u.save()
 print("PAS_ADMIN_OK")
 ' 2>/dev/null || true)
-    if contains "$pw_out" 'PAS_ADMIN_OK'; then
-        print_success "Admin '$PAS_ADMIN_USER' can log in with the password in .env"
-    else
-        print_warning "Could not reset the admin password. The backup's own password still works."
-    fi
+    contains "$out" 'PAS_ADMIN_OK' || return 1
+    # Checked, not assumed.
+    [[ $(pw_probe) == PAS_PW_MATCH ]]
+}
+
+# A restored database carries the admin password and the API token from the
+# machine the backup came from, while .env still holds this machine's. Restoring
+# onto a fresh install (the actual disaster-recovery path) therefore printed an
+# admin password that did not work, and left paperless-gpt holding a dead token.
+#
+# The two are NOT symmetric, and the first version of this got the password
+# wrong by treating them the same way:
+#   * API token: .env <- database. The database owns the token; .env only holds
+#     a copy for paperless-gpt to read. Copying it back destroys nothing.
+#   * Admin password: the database owns it too, and it is the user's OWN
+#     password -- the one they changed after the install and which their backup
+#     correctly contains. Writing .env's password over it silently threw that
+#     away and then reported the login was fine. So: check it, say what is
+#     true, and only overwrite when the user asks.
+reconcile_identity() {
+    print_step "Checking the admin login and the API token..."
+
+    local tries=0
+    until dc exec -T webserver curl -fsS --max-time 3 http://localhost:8000 >/dev/null 2>&1; do
+        tries=$(( tries + 1 ))
+        if (( tries >= 60 )); then
+            print_warning "Paperless-ngx has not come back up yet, so nothing was checked."
+            echo "      When it is up, run ./install.sh again."
+            return 0
+        fi
+        sleep 5
+    done
+
+    case "$(pw_probe)" in
+        PAS_PW_MATCH)
+            print_success "Admin '$PAS_ADMIN_USER' can log in with the password in .env"
+            ;;
+        PAS_PW_NOUSER)
+            print_warning "The backup has no user called '$PAS_ADMIN_USER'."
+            if set_admin_pw; then
+                print_success "Created admin '$PAS_ADMIN_USER' with the password in .env"
+            else
+                print_warning "Could not create it. Log in with an admin account from the backup."
+            fi
+            ;;
+        PAS_PW_DIFFERS)
+            echo
+            print_warning "Your admin password is now the one from the BACKUP, not the one in .env."
+            echo "  That is almost always what you want: the backup holds the password you"
+            echo "  set yourself. Log in with the password you used when you took that backup."
+            echo "  ${BOLD}The password printed in .env is out of date — it is not your login.${NC}"
+            echo
+            local do_reset=$RESET_ADMIN_PW
+            if ! (( do_reset )) && ! (( NONINTERACTIVE )); then
+                echo "  Lost that password (restoring onto a new machine, for example)?"
+                local ans=""
+                read -r -p "${CYAN}Overwrite it with the password from .env? [y/${BOLD}N${NC}${CYAN}]: ${NC}" ans || true
+                case ${ans,,} in y|yes) do_reset=1 ;; esac
+            fi
+            if (( do_reset )); then
+                if set_admin_pw; then
+                    print_success "Admin '$PAS_ADMIN_USER' now uses the password in .env — checked, not assumed"
+                else
+                    print_warning "Could not reset it. The backup's own password still works."
+                fi
+            else
+                print_info "Password left exactly as the backup had it. Nothing was changed."
+                echo "      To overwrite it later:  ./install.sh restore <file> --reset-admin-password"
+            fi
+            ;;
+        *)
+            print_warning "Could not check the admin password. The backup's own password should still work."
+            ;;
+    esac
 
     if [[ $PAS_AI_MODE != none ]]; then
         local token
@@ -2254,8 +2374,14 @@ Options:
   --yes, -y          do not ask anything; use .env / PAS_* environment variables
   --purge-data       with 'uninstall': also delete the data volumes (destructive)
   --no-safety-dump   with 'restore': do not save the database being replaced
+  --reset-admin-password
+                     with 'restore': overwrite the restored admin password with
+                     the one in .env. Without this, restore keeps the password
+                     the backup contains (which is your own).
 
 Everything lives in this folder. Passwords are in ./.env (chmod 600).
+'backups/' also collects pre-restore-*.sql.gz and failed-restore-*.log from
+restore drills. Nothing prunes them — delete the old ones when you are happy.
 EOF
 }
 
@@ -2270,6 +2396,7 @@ main() {
             --yes|-y)     NONINTERACTIVE=1 ;;
             --purge-data) purge=1 ;;
             --no-safety-dump) SAFETY_DUMP=0 ;;
+            --reset-admin-password) RESET_ADMIN_PW=1 ;;
             -h|--help)    usage; return 0 ;;
             --*)          usage; die "Unknown option: $1" ;;
             *)            if [[ -z $cmd ]]; then cmd=$1; else pos+=("$1"); fi ;;
