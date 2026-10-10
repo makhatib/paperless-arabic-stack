@@ -1,0 +1,11 @@
+# A deliberately bare Ubuntu 24.04 "VM": systemd, but NO docker and NO compose.
+# This is the fresh target for the NOM-144 installer test.
+FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      systemd systemd-sysv dbus sudo curl ca-certificates iproute2 git nano less \
+ && apt-get clean && rm -rf /var/lib/apt/lists/*
+RUN systemctl mask systemd-resolved systemd-networkd-wait-online getty@tty1 || true
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]
