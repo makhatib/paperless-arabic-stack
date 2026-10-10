@@ -74,6 +74,11 @@ print_warning() { echo "${YELLOW}⚠ $1${NC}"; }
 print_info()    { echo "${BLUE}ℹ $1${NC}"; }
 print_step()    { echo "${MAGENTA}→ $1${NC}"; }
 
+# Steps 8 and 9 are optional (no AI / no local models), so the numbers are
+# counted at runtime. Hard-coding them left a confusing "Step 8 ... Step 10".
+STEP_NO=0
+step_header() { STEP_NO=$(( STEP_NO + 1 )); print_header "Step ${STEP_NO}: $1"; }
+
 die() { print_error "$1"; exit 1; }
 
 on_error() {
@@ -95,10 +100,24 @@ command_exists() { command -v "$1" >/dev/null 2>&1; }
 
 # A password/secret made of url-safe characters only, so it never breaks .env,
 # YAML, a shell command, or a copy/paste into a browser.
+#
+# Note the shape of the pipeline: a bounded `head` FEEDS `tr`. Writing it the
+# obvious way round -- `tr -dc ... < /dev/urandom | head -c N` -- makes head
+# close the pipe as soon as it has N bytes, tr dies of SIGPIPE, and with
+# `set -o pipefail` the whole script aborts with exit 141.
 generate_secret() {
-    local len=${1:-32}
-    LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c "$len"
+    local len=${1:-32} out=""
+    while (( ${#out} < len )); do
+        out+=$(head -c 256 /dev/urandom | LC_ALL=C tr -dc 'A-Za-z0-9' || true)
+    done
+    printf '%s' "${out:0:len}"
 }
+
+# `grep -q` stops reading at the first match, which SIGPIPEs whatever is piping
+# into it; under `pipefail` a successful match then reports 141. Everywhere we
+# need "does this output contain X", capture first and match against a string.
+contains() { grep -qE -- "$2" <<<"$1"; }
+contains_line() { grep -qxF -- "$2" <<<"$1"; }
 
 validate_domain() {
     [[ $1 =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$ ]]
@@ -108,6 +127,17 @@ validate_label() {   # a single DNS label, e.g. "docs"
 }
 validate_email() {
     [[ $1 =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]
+}
+# Let's Encrypt refuses to create an account for a reserved TLD, and the error it
+# returns ("Domain name does not end with a valid public suffix") appears much
+# later, buried in the Traefik log, long after the install looks finished. Catch
+# it while we still have the user in front of us.
+email_tld_is_reserved() {
+    local tld=${1##*.}
+    case ${tld,,} in
+        example|invalid|local|localhost|test|internal|lan|home|corp) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 validate_port() {
     [[ $1 =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 65535 ))
@@ -224,19 +254,31 @@ ask_secret() {
 }
 
 port_in_use() {
-    local port=$1
+    local port=$1 listening=""
     if command_exists ss; then
-        ss -H -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${port}\$"
+        listening=$(ss -H -ltn 2>/dev/null | awk '{print $4}')
     elif command_exists netstat; then
-        netstat -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${port}\$"
+        listening=$(netstat -ltn 2>/dev/null | awk 'NR>2{print $4}')
     else
         return 1   # cannot tell; caller warns
     fi
+    contains "$listening" "[:.]${port}\$"
 }
 
 have_port_tool() { command_exists ss || command_exists netstat; }
 
-dc() { docker compose "$@"; }
+# compose interpolates the WHOLE file on every command, so the `:?` guard on
+# PAPERLESS_API_TOKEN would make `pull` and the first `up` fail during install --
+# the token can only be created after paperless-ngx is already running. Feed
+# compose a placeholder until the real token exists. It is never written to
+# .env, and paperless-gpt is not started during those phases.
+dc() {
+    if [[ -z ${PAPERLESS_API_TOKEN:-} ]]; then
+        PAPERLESS_API_TOKEN="pending-install" docker compose "$@"
+    else
+        docker compose "$@"
+    fi
+}
 
 # Total RAM in MB and free disk in GB for the install directory.
 ram_mb()  { awk '/^MemTotal:/ {printf "%d", $2/1024}' /proc/meminfo; }
@@ -358,7 +400,7 @@ install_docker() {
 }
 
 precheck() {
-    print_header "Step 1: Checking this machine"
+    step_header "Checking this machine"
 
     # --- OS ---
     local os_name="unknown" os_ver=""
@@ -429,7 +471,8 @@ precheck() {
     # --- GPU ---
     GPU_AVAILABLE=no
     if command_exists nvidia-smi && nvidia-smi -L >/dev/null 2>&1; then
-        if docker info 2>/dev/null | grep -qi 'nvidia'; then
+        local dinfo; dinfo=$(docker info 2>/dev/null || true)
+        if contains "$dinfo" '[Nn][Vv][Ii][Dd][Ii][Aa]'; then
             GPU_AVAILABLE=yes
             print_success "NVIDIA GPU found and usable from Docker: $(nvidia-smi -L | head -1)"
         else
@@ -461,7 +504,7 @@ check_port_or_ask() {   # check_port_or_ask VAR "what it is for"
 ################################################################################
 
 ask_config() {
-    print_header "Step 2: A few questions"
+    step_header "A few questions"
 
     # ---------------------------------------------------------------- target --
     echo "Where are you installing this?"
@@ -478,8 +521,15 @@ ask_config() {
             "Use letters, numbers and dashes only. Example: docs"
         ask_validated PAS_AI_SUB   "Subdomain for Paperless-GPT (the AI screen)" "ai-docs" validate_label \
             "Use letters, numbers and dashes only. Example: ai-docs"
-        ask_validated PAS_LE_EMAIL "Your email (Let's Encrypt uses it for expiry warnings)" "" validate_email \
-            "That does not look like an email address."
+        while true; do
+            ask_validated PAS_LE_EMAIL "Your email (Let's Encrypt uses it for expiry warnings)" "" validate_email \
+                "That does not look like an email address."
+            if ! email_tld_is_reserved "$PAS_LE_EMAIL"; then break; fi
+            print_error "Let's Encrypt will reject '$PAS_LE_EMAIL' — '.${PAS_LE_EMAIL##*.}' is a reserved domain ending."
+            echo "  Use a real address you can receive mail at (gmail.com, your own domain, ...)."
+            (( NONINTERACTIVE )) && die "non-interactive mode: PAS_LE_EMAIL must use a real public domain"
+            PAS_LE_EMAIL=""
+        done
         ask_yes_no PAS_LE_STAGING "Use the Let's Encrypt STAGING server? (only for testing — browsers will warn)" N
 
         # --- the DNS gate: nothing works without these two records ---
@@ -546,12 +596,23 @@ ask_config() {
         "arabic   — Arabic only" \
         "english  — English only" \
         "both     — Arabic and English (most common in the Gulf)"
+    # These two variables take DIFFERENT formats, and getting it wrong fails
+    # silently. Verified against the image's own init script
+    # (/etc/s6-overlay/s6-rc.d/init-tesseract-langs/run, v3.3.0):
+    #   PAPERLESS_OCR_LANGUAGES -> SPACE-separated list; each entry becomes the
+    #                              apt package tesseract-ocr-<entry>
+    #   PAPERLESS_OCR_LANGUAGE  -> the language used to read a document, joined
+    #                              with "+"
+    # Writing "ara+eng" into the first one asks apt for a package called
+    # tesseract-ocr-ara+eng, which does not exist. The container logs one line
+    # ("Package not found! :(") and starts anyway -- with no Arabic OCR at all.
     case $PAS_DOC_LANG in
         arabic)  PAS_OCR_LANGUAGES="ara";     PAS_OCR_LANGUAGE="ara" ;;
         english) PAS_OCR_LANGUAGES="eng";     PAS_OCR_LANGUAGE="eng" ;;
-        both|*)  PAS_OCR_LANGUAGES="ara+eng"; PAS_OCR_LANGUAGE="ara+eng" ;;
+        both|*)  PAS_OCR_LANGUAGES="ara eng"; PAS_OCR_LANGUAGE="ara+eng" ;;
     esac
-    print_info "OCR languages: $PAS_OCR_LANGUAGE"
+    print_info "OCR language packs to install: $PAS_OCR_LANGUAGES"
+    print_info "OCR reading language: $PAS_OCR_LANGUAGE"
 
     # ------------------------------------------------------------------- AI --
     echo
@@ -694,6 +755,17 @@ ask_config() {
     echo
     ask PAS_ADMIN_USER "Admin username for Paperless-ngx" "admin"
     ask PAS_ADMIN_MAIL "Admin email" "admin@${PAS_DOMAIN:-localhost}"
+
+    # Which user the apps run as INSIDE their containers. Installing as root is
+    # normal on a VPS, but that is no reason to run Paperless as root too, so
+    # fall back to 1000 and chown the bind-mounted folders to match.
+    if (( EUID == 0 )); then
+        PAS_PUID=${PAS_PUID:-1000}
+        PAS_PGID=${PAS_PGID:-1000}
+    else
+        PAS_PUID=$(id -u)
+        PAS_PGID=$(id -g)
+    fi
 }
 
 ################################################################################
@@ -701,7 +773,7 @@ ask_config() {
 ################################################################################
 
 write_env() {
-    print_header "Step 3: Passwords and settings"
+    step_header "Passwords and settings"
 
     # Secrets are generated once and then reused on every re-run.
     PAPERLESS_SECRET_KEY=${PAPERLESS_SECRET_KEY:-$(generate_secret 50)}
@@ -723,7 +795,7 @@ write_env() {
              PAS_DOC_LANG PAS_OCR_LANGUAGES PAS_OCR_LANGUAGE PAS_TZ \
              PAS_AI_MODE PAS_OLLAMA_MODE PAS_OLLAMA_URL PAS_TEXT_MODEL PAS_VISION_MODEL PAS_GPU \
              PAS_CLOUD_PROVIDER PAS_CLOUD_BASE_URL PAS_CLOUD_MODEL \
-             PAS_ADMIN_USER PAS_ADMIN_MAIL PAS_ADMIN_PASSWORD \
+             PAS_ADMIN_USER PAS_ADMIN_MAIL PAS_ADMIN_PASSWORD PAS_PUID PAS_PGID \
              PAS_BASIC_AUTH_USER PAS_BASIC_AUTH_PASS PAS_BASIC_AUTH_HASH \
              PAPERLESS_SECRET_KEY PAPERLESS_DBPASS PAS_CLOUD_API_KEY; do
         env_set "$k" "${!k:-}"
@@ -762,7 +834,7 @@ htpasswd_line() {
 ################################################################################
 
 write_compose() {
-    print_header "Step 4: Writing compose.yaml"
+    step_header "Writing compose.yaml"
 
     local tmp; tmp=$(mktemp "$SCRIPT_DIR/compose.yaml.XXXXXX")
 
@@ -854,13 +926,13 @@ YAML
       # --- OCR / region ---
       # PAPERLESS_OCR_LANGUAGES installs the tesseract language packages;
       # PAPERLESS_OCR_LANGUAGE is the language actually used to read a document.
-      PAPERLESS_OCR_LANGUAGES: \${PAS_OCR_LANGUAGES}
-      PAPERLESS_OCR_LANGUAGE: \${PAS_OCR_LANGUAGE}
+      PAPERLESS_OCR_LANGUAGES: "\${PAS_OCR_LANGUAGES}"
+      PAPERLESS_OCR_LANGUAGE: "\${PAS_OCR_LANGUAGE}"
       PAPERLESS_TIME_ZONE: \${PAS_TZ}
       PAPERLESS_DATE_ORDER: DMY
       PAPERLESS_DATE_PARSER_LANGUAGES: ar+en
-      USERMAP_UID: $(id -u)
-      USERMAP_GID: $(id -g)
+      USERMAP_UID: \${PAS_PUID}
+      USERMAP_GID: \${PAS_PGID}
 YAML
 
     if [[ $PAS_TARGET == vps ]]; then
@@ -957,8 +1029,8 @@ YAML
       - ./config:/app/config
       - ./db:/app/db
     environment:
-      PUID: $(id -u)
-      PGID: $(id -g)
+      PUID: \${PAS_PUID}
+      PGID: \${PAS_PGID}
       # --- link to paperless-ngx (inside the project network, no proxy) ---
       PAPERLESS_BASE_URL: http://webserver:8000
       PAPERLESS_API_TOKEN: \${PAPERLESS_API_TOKEN:?run ./install.sh to create the API token}
@@ -1142,9 +1214,15 @@ YAML
 ################################################################################
 
 write_prompts() {
-    print_header "Step 5: Folders and AI prompts"
+    step_header "Folders and AI prompts"
 
     mkdir -p "$CONSUME_DIR" "$EXPORT_DIR" "$CONFIG_DIR" "$GPTDB_DIR" "$BACKUP_DIR" "$PROMPTS_DIR"
+    # The containers run as PAS_PUID:PAS_PGID, so the bind-mounted folders have
+    # to belong to that user or nothing can be written into them.
+    if (( EUID == 0 )); then
+        chown -R "${PAS_PUID}:${PAS_PGID}" \
+            "$CONSUME_DIR" "$EXPORT_DIR" "$CONFIG_DIR" "$GPTDB_DIR" "$PROMPTS_DIR" 2>/dev/null || true
+    fi
     print_success "Folders ready (drop files into ./consume to import them automatically)"
 
     [[ $PAS_AI_MODE == none ]] && { print_info "No AI selected — skipping prompts."; return 0; }
@@ -1156,6 +1234,10 @@ write_prompts() {
     local seeded=0 f
     while IFS= read -r f; do
         [[ -z $f ]] && continue
+        # ocr_prompt.tmpl is handled below: we ship our own Arabic version and
+        # must not let the upstream copy land first, or it looks like a file the
+        # user edited and ours is never installed.
+        [[ $f == ocr_prompt.tmpl ]] && continue
         if [[ ! -f "$PROMPTS_DIR/$f" ]]; then
             docker run --rm --entrypoint cat "$img" "/app/default_prompts/$f" > "$PROMPTS_DIR/$f"
             seeded=$(( seeded + 1 ))
@@ -1200,14 +1282,14 @@ write_prompts() {
 CORE_SERVICES=(db broker gotenberg tika webserver)
 
 pull_images() {
-    print_header "Step 6: Downloading the images"
+    step_header "Downloading the images"
     print_info "First time this takes a few minutes. Later runs are fast."
     dc pull --quiet 2>/dev/null || dc pull
     print_success "All images downloaded"
 }
 
 start_core() {
-    print_header "Step 7: Starting Paperless-ngx"
+    step_header "Starting Paperless-ngx"
     dc up -d "${CORE_SERVICES[@]}"
     [[ $PAS_TARGET == vps ]] && dc up -d traefik
     print_info "Waiting for Paperless-ngx to finish its first-time setup..."
@@ -1215,20 +1297,28 @@ start_core() {
         print_info "(It installs the tesseract language pack on every boot, so the first boot is the slow one.)"
     fi
 
-    local tries=0 max=80
+    # First boot does: install the language pack, then run every database
+    # migration. On a small 2-vCPU VPS that genuinely takes several minutes, so
+    # the budget here is deliberately generous (15 min) -- a timeout that is too
+    # short just turns a slow server into a scary false failure.
+    local tries=0 max=180
     until dc exec -T webserver curl -fsS --max-time 3 http://localhost:8000 >/dev/null 2>&1; do
         tries=$(( tries + 1 ))
         if (( tries >= max )); then
-            print_error "Paperless-ngx did not come up in time."
+            print_error "Paperless-ngx did not come up within 15 minutes."
             echo "  Look at the logs:  docker compose logs --tail 60 webserver"
+            echo "  Then just run ./install.sh again — it picks up where it stopped."
             exit 1
         fi
-        (( tries % 6 == 0 )) && printf '    ...still starting (%ds)\n' $(( tries * 5 ))
+        if (( tries % 12 == 0 )); then
+            printf '    ...still starting (%d min). First boot is the slow one.\n' $(( tries / 12 ))
+        fi
         sleep 5
     done
     print_success "Paperless-ngx is up"
 
-    if dc logs webserver 2>/dev/null | grep -q 'Created superuser'; then
+    local wlogs; wlogs=$(dc logs webserver 2>/dev/null || true)
+    if contains "$wlogs" 'Created superuser'; then
         print_success "Admin user '$PAS_ADMIN_USER' created"
     else
         print_info "Admin user '$PAS_ADMIN_USER' already existed — password unchanged."
@@ -1239,7 +1329,7 @@ start_core() {
 # user never has to copy/paste it out of the web UI.
 fetch_api_token() {
     [[ $PAS_AI_MODE == none ]] && return 0
-    print_header "Step 8: Connecting Paperless-GPT to Paperless-ngx"
+    step_header "Connecting Paperless-GPT to Paperless-ngx"
 
     local token
     token=$(dc exec -T webserver python3 /usr/src/paperless/src/manage.py shell -c '
@@ -1265,6 +1355,45 @@ else:
     print_success "API token created and injected into Paperless-GPT (nothing to copy by hand)"
 }
 
+api_tag_names() {
+    dc exec -T webserver curl -fsS \
+        -H "Authorization: Token ${PAPERLESS_API_TOKEN}" \
+        "http://localhost:8000/api/tags/?page_size=200" 2>/dev/null \
+      | tr ',' '\n' | grep -oE '"name":"[^"]*"' | cut -d'"' -f4 | sort || true
+}
+
+# paperless-gpt creates only its two OUTPUT tags on startup (-failed and
+# -auto-complete). The three tags you actually need in order to TRIGGER it do
+# not exist on a fresh install -- measured on a clean container, tag count 2.
+# Without them a new user has nothing to tag a document with, and has to guess
+# the exact spelling by hand. So we create them.
+create_trigger_tags() {
+    [[ $PAS_AI_MODE == none ]] && return 0
+    step_header "Creating the AI trigger tags"
+
+    local existing; existing=$(api_tag_names)
+    local -a want=(paperless-gpt paperless-gpt-auto paperless-gpt-ocr-auto)
+    local -a colour=("#1f78b4" "#33a02c" "#e31a1c")
+    local i=0 t
+    for t in "${want[@]}"; do
+        if contains_line "$existing" "$t"; then
+            print_success "Tag '$t' is already there"
+        elif dc exec -T webserver curl -fsS -o /dev/null -X POST \
+                -H "Authorization: Token ${PAPERLESS_API_TOKEN}" \
+                -H "Content-Type: application/json" \
+                -d "{\"name\":\"${t}\",\"color\":\"${colour[$i]}\",\"matching_algorithm\":0,\"match\":\"\",\"is_insensitive\":true}" \
+                "http://localhost:8000/api/tags/" 2>/dev/null; then
+            # matching_algorithm 0 is "None" (confirmed from the API's own
+            # OPTIONS response). These tags must never attach themselves to a
+            # document -- you put them on deliberately, to ask the AI for work.
+            print_success "Created tag '$t'"
+        else
+            print_warning "Could not create the tag '$t'. Add it by hand in Paperless-ngx (exact spelling)."
+        fi
+        i=$(( i + 1 ))
+    done
+}
+
 pull_models() {
     [[ $PAS_AI_MODE == local ]] || return 0
     [[ ${PAS_OLLAMA_MODE} == container ]] || {
@@ -1274,7 +1403,7 @@ pull_models() {
         return 0
     }
 
-    print_header "Step 9: Downloading the AI models"
+    step_header "Downloading the AI models"
     dc up -d ollama
     local tries=0
     until dc exec -T ollama ollama list >/dev/null 2>&1; do
@@ -1286,7 +1415,7 @@ pull_models() {
     have=$(dc exec -T ollama ollama list 2>/dev/null | awk 'NR>1{print $1}')
     for m in "$PAS_TEXT_MODEL" "$PAS_VISION_MODEL"; do
         [[ -z $m ]] && continue
-        if grep -qxF "$m" <<<"$have"; then
+        if contains_line "$have" "$m"; then
             print_success "Model $m is already downloaded"
             continue
         fi
@@ -1302,20 +1431,38 @@ pull_models() {
 }
 
 start_all() {
-    print_header "Step 10: Starting everything"
+    step_header "Starting everything"
     dc up -d --remove-orphans
     sleep 5
     dc ps
 }
 
 verify() {
-    print_header "Step 11: Checking it actually works"
+    step_header "Checking it actually works"
     local ok=1
 
     if dc exec -T webserver curl -fsS --max-time 5 http://localhost:8000 >/dev/null 2>&1; then
         print_success "Paperless-ngx answers on its own port"
     else
         print_error "Paperless-ngx is not answering"; ok=0
+    fi
+
+    # The OCR language is the whole point, and a missing language pack does NOT
+    # stop the container -- it logs one line and carries on. So check for real
+    # that every language we asked for is actually installed.
+    local have_langs missing=""
+    have_langs=$(dc exec -T webserver tesseract --list-langs 2>/dev/null | tail -n +2 || true)
+    local want
+    for want in ${PAS_OCR_LANGUAGE//+/ }; do
+        contains_line "$have_langs" "$want" || missing+=" $want"
+    done
+    if [[ -z $missing ]]; then
+        print_success "OCR languages installed and usable: $PAS_OCR_LANGUAGE"
+    else
+        print_error "OCR language(s) MISSING inside the container:$missing"
+        echo "      Documents will fail to OCR. Almost always no internet at container boot."
+        echo "      Fix the connection and run:  docker compose up -d --force-recreate webserver"
+        ok=0
     fi
 
     if [[ $PAS_TARGET == homelab ]]; then
@@ -1327,30 +1474,41 @@ verify() {
     fi
 
     if [[ $PAS_AI_MODE != none ]]; then
-        if [[ $(dc ps -q paperless-gpt) ]] && dc ps paperless-gpt | grep -qi 'up'; then
+        local gpt_running; gpt_running=$(dc ps --status running --services 2>/dev/null || true)
+        if contains_line "$gpt_running" 'paperless-gpt'; then
             print_success "Paperless-GPT container is running"
         else
             print_error "Paperless-GPT is not running — check: docker compose logs paperless-gpt"; ok=0
         fi
 
-        # The trigger tags are created by paperless-gpt on startup.
-        local tags
-        tags=$(dc exec -T webserver curl -fsS \
-                 -H "Authorization: Token ${PAPERLESS_API_TOKEN}" \
-                 "http://localhost:8000/api/tags/?page_size=100" 2>/dev/null \
-               | tr ',' '\n' | grep -oE '"name":"paperless-gpt[^"]*"' | cut -d'"' -f4 | sort || true)
-        if [[ -n $tags ]]; then
-            print_success "AI trigger tags exist in Paperless-ngx:"
-            while IFS= read -r t; do echo "      • $t"; done <<<"$tags"
+        # paperless-gpt creates its trigger tags shortly AFTER it starts, so this
+        # has to wait for them. Checking once reported only the two tags that
+        # happened to exist in that first second, which looked like a failure.
+        local want_tags=(paperless-gpt paperless-gpt-auto paperless-gpt-ocr-auto paperless-gpt-failed)
+        local tags="" t waited=0 missing_tags
+        while (( waited < 60 )); do
+            tags=$(api_tag_names)
+            missing_tags=""
+            for t in "${want_tags[@]}"; do
+                contains_line "$tags" "$t" || missing_tags+=" $t"
+            done
+            [[ -z $missing_tags ]] && break
+            sleep 5; waited=$(( waited + 5 ))
+        done
+        if [[ -z $missing_tags ]]; then
+            print_success "All four AI trigger tags exist in Paperless-ngx:"
+            for t in "${want_tags[@]}"; do echo "      • $t"; done
         else
-            print_warning "The paperless-gpt tags are not there yet. They appear a few seconds after it starts."
+            print_warning "These AI trigger tags have not appeared yet:$missing_tags"
+            echo "      paperless-gpt creates them on startup. Check: docker compose logs paperless-gpt"
+            echo "      A wrong API token is the usual cause — re-run ./install.sh to recreate it."
         fi
     fi
 
     if [[ $PAS_TARGET == vps ]]; then
-        if curl -fsS --max-time 5 -o /dev/null "http://127.0.0.1/" 2>/dev/null \
-           || curl -s --max-time 5 -o /dev/null -w '%{http_code}' "http://127.0.0.1/" | grep -qE '30[0-9]'; then
-            print_success "Traefik is answering on port 80"
+        local t_code; t_code=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' "http://127.0.0.1/" 2>/dev/null || true)
+        if [[ $t_code =~ ^(200|30[0-9]|40[0-9])$ ]]; then
+            print_success "Traefik is answering on port 80 (HTTP $t_code)"
         else
             print_warning "Traefik did not answer on port 80 yet."
         fi
@@ -1519,6 +1677,7 @@ cmd_install() {
     pull_images
     start_core
     fetch_api_token
+    create_trigger_tags
     pull_models
     start_all
     verify
@@ -1542,7 +1701,8 @@ cmd_status() {
         print_error "Paperless-ngx: NOT answering"
     fi
     if [[ ${PAS_AI_MODE:-none} != none ]]; then
-        if dc ps --status running --services 2>/dev/null | grep -qx paperless-gpt; then
+        local running; running=$(dc ps --status running --services 2>/dev/null || true)
+        if contains_line "$running" 'paperless-gpt'; then
             print_success "Paperless-GPT: running"
         else
             print_error "Paperless-GPT: not running"
@@ -1554,16 +1714,24 @@ cmd_status() {
         dc exec -T ollama ollama list 2>/dev/null || print_warning "Ollama is not answering."
         # A model that does not fit in VRAM silently falls back to the CPU.
         if [[ ${PAS_GPU:-no} == yes ]]; then
-            dc exec -T ollama sh -c 'command -v curl >/dev/null && curl -fsS http://localhost:11434/api/ps' 2>/dev/null \
-                | grep -q size_vram && print_info "Tip: if size_vram is smaller than size, part of the model is on the CPU."
+            local psjson
+            psjson=$(dc exec -T ollama sh -c 'command -v curl >/dev/null && curl -fsS http://localhost:11434/api/ps' 2>/dev/null || true)
+            contains "$psjson" 'size_vram' \
+                && print_info "Tip: if size_vram is smaller than size, part of the model is on the CPU."
         fi
     fi
     echo
     print_step "Disk used by your documents and database"
     local v
     for v in data media pgdata; do
-        local vol="${COMPOSE_PROJECT}_${v}" sz
-        sz=$(docker run --rm -v "${vol}:/v" docker.io/library/alpine:3 du -sh /v 2>/dev/null | awk '{print $1}')
+        local vol="${COMPOSE_PROJECT}_${v}" sz=""
+        # Guard first: `docker run -v name:/v` silently CREATES a missing volume,
+        # so an unguarded size check litters the host with empty volumes.
+        if docker volume inspect "$vol" >/dev/null 2>&1; then
+            sz=$(docker run --rm -v "${vol}:/v" docker.io/library/alpine:3 du -sh /v 2>/dev/null | awk '{print $1}')
+        else
+            sz="not created yet"
+        fi
         printf '  %-10s %s\n' "$v" "${sz:-?}"
     done
     echo
@@ -1696,10 +1864,12 @@ cmd_restore() {
     dc stop webserver paperless-gpt 2>/dev/null || true
 
     print_step "Restoring the database..."
-    gunzip -c "$work/db.sql.gz" | dc exec -T db psql -q -U paperless -d postgres \
-        -c 'DROP DATABASE IF EXISTS paperless_restore;' >/dev/null 2>&1 || true
-    dc exec -T db psql -q -U paperless -d postgres -c 'DROP DATABASE IF EXISTS paperless;' >/dev/null
-    dc exec -T db psql -q -U paperless -d postgres -c 'CREATE DATABASE paperless OWNER paperless;' >/dev/null
+    # WITH (FORCE) kicks off any session still holding the database open; without
+    # it the DROP blocks forever behind a worker that has not noticed the stop.
+    dc exec -T db psql -q -U paperless -d postgres \
+        -c 'DROP DATABASE IF EXISTS paperless WITH (FORCE);' >/dev/null
+    dc exec -T db psql -q -U paperless -d postgres \
+        -c 'CREATE DATABASE paperless OWNER paperless;' >/dev/null
     gunzip -c "$work/db.sql.gz" | dc exec -T db psql -q -U paperless -d paperless >/dev/null
     print_success "Database restored"
 
