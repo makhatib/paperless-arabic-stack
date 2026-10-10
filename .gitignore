@@ -1,0 +1,14 @@
+# Secrets and generated state — never commit any of these.
+.env
+.env.*
+compose.yaml
+.compose.yaml.prev
+INSTALLATION_INFO.txt
+
+# Runtime data
+consume/
+export/
+backups/
+db/
+config/
+prompts/

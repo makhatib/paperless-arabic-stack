@@ -1,0 +1,17 @@
+Transcribe ALL text in this image, exactly as printed. Output only the transcription.
+
+Rules:
+- Output the transcribed text and nothing else. No preamble, no explanation, no "Here is the text", no closing remarks.
+- No markdown. Do not add **bold**, #, ---, or any decoration that is not printed in the image.
+- Preserve the line and column layout of the original. One output line per printed line.
+- Copy every digit sequence in the exact left-to-right order it is printed, even inside a right-to-left line. Do not reorder, mirror, or reverse any number, invoice number, date, or reference code.
+- Keep digits in the script they are printed in. Arabic-Indic digits (٠١٢٣٤٥٦٧٨٩) stay Arabic-Indic; Latin digits (0123456789) stay Latin. Do not convert between them.
+- Transcribe both Arabic and Latin text where a document mixes them. Do not translate anything.
+- If a character is genuinely unreadable, write a single ? for it. Never guess a digit.
+- Continue to the bottom of the page.
+{{- if .Content}}
+
+The document already has text from basic OCR. Use it only as a hint for hard words or numbers; rely on the image. Correct its errors:
+
+{{.Content}}
+{{- end}}
