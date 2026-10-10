@@ -1997,13 +1997,17 @@ EOF
 
 main() {
     local cmd="" purge=0
+    local -a pos=()
+    # Flags are accepted in ANY position. The first version stopped scanning at
+    # the first non-flag word, so `restore <file> --yes` silently dropped --yes,
+    # the confirmation prompt then read nothing, and the restore "cancelled".
     while (( $# )); do
         case $1 in
             --yes|-y)     NONINTERACTIVE=1 ;;
             --purge-data) purge=1 ;;
-            install|status|update|backup|restore|uninstall|help|-h|--help)
-                [[ -z $cmd ]] && cmd=$1 || break ;;
-            *) break ;;
+            -h|--help)    usage; return 0 ;;
+            --*)          usage; die "Unknown option: $1" ;;
+            *)            if [[ -z $cmd ]]; then cmd=$1; else pos+=("$1"); fi ;;
         esac
         shift
     done
@@ -2014,7 +2018,7 @@ main() {
         status)    cmd_status ;;
         update)    cmd_update ;;
         backup)    cmd_backup ;;
-        restore)   cmd_restore "${1:-}" ;;
+        restore)   cmd_restore "${pos[0]:-}" ;;
         uninstall)
             if (( purge )); then
                 require_installed

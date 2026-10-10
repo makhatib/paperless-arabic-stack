@@ -325,3 +325,32 @@ Your Arabic documents, searchable with AI
 
 YouTube: https://youtube.com/@malkhatib
 ```
+
+---
+
+## Testing notes
+
+This installer was tested by running it on **bare Ubuntu 24.04 containers with no
+Docker and no Compose installed**, once per target, and then re-running it to
+prove a repeat is safe. Measured on a fresh install with cloud AI, using the same
+Arabic phone-photo invoice as our earlier phases:
+
+| | Text similarity to the original | Digits read correctly |
+|---|---|---|
+| Plain OCR (Tesseract) | 43.4% | 15 / 73 |
+| After `paperless-gpt-ocr-auto` | **99.2%** | **73 / 73** |
+
+(That counts individual digits. The "1 of 26 / 26 of 26" figures earlier in this
+file count whole numbers on the same invoice — same document, same result, just a
+different way of counting.)
+
+`backup` → delete a document → `restore` was run as a real drill, not just
+configured. Four consecutive `./install.sh` runs complete successfully and the
+last two generate a byte-identical `compose.yaml`.
+
+What could **not** be tested in that lab: issuing a real Let's Encrypt
+certificate, because the test machine cannot receive an inbound connection on
+port 80 from the internet. Everything up to that point is verified — account
+registration, the certificate request, publishing the challenge token, and
+(most importantly) that the HTTP→HTTPS redirect does **not** swallow
+`/.well-known/acme-challenge/`, which is the usual way this silently breaks.
