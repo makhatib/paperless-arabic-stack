@@ -1351,10 +1351,10 @@ write_prompts() {
     local seeded=0 f
     while IFS= read -r f; do
         [[ -z $f ]] && continue
-        # ocr_prompt.tmpl is handled below: we ship our own Arabic version and
-        # must not let the upstream copy land first, or it looks like a file the
-        # user edited and ours is never installed.
-        [[ $f == ocr_prompt.tmpl ]] && continue
+        # Anything we ship an Arabic version of is handled below. The upstream
+        # copy must not land first, or it looks like a file the user edited and
+        # ours is never installed.
+        [[ -f "$SCRIPT_DIR/prompts-ar/$f" ]] && continue
         if [[ ! -f "$PROMPTS_DIR/$f" ]]; then
             docker run --rm --entrypoint cat "$img" "/app/default_prompts/$f" > "$PROMPTS_DIR/$f"
             seeded=$(( seeded + 1 ))
@@ -1362,31 +1362,48 @@ write_prompts() {
     done < <(docker run --rm --entrypoint sh "$img" -c 'ls -1 /app/default_prompts' 2>/dev/null)
     (( seeded )) && print_success "Copied $seeded default prompt template(s) from the paperless-gpt image"
 
-    # Our Arabic OCR prompt replaces the upstream one. The upstream prompt ends
-    # with "Use markdown format" and a friendly tone, and the model then writes
-    # chatter like "Here is the transcribed text..." straight INTO the document.
-    # Replacing it moved text similarity from 82.7% to 90.0% on our test image.
-    local ocr="$PROMPTS_DIR/ocr_prompt.tmpl"
-    local shipped="$SCRIPT_DIR/prompts-ar/ocr_prompt.tmpl"
-    local stamp="$PROMPTS_DIR/.ocr_prompt.installed.sha256"
-    if [[ -f $shipped ]]; then
-        local new_sum; new_sum=$(sha256sum "$shipped" | awk '{print $1}')
-        local cur_sum=""; [[ -f $ocr ]] && cur_sum=$(sha256sum "$ocr" | awk '{print $1}')
-        local last_sum=""; [[ -f $stamp ]] && last_sum=$(cat "$stamp")
+    # Every template in prompts-ar/ replaces the upstream one of the same name.
+    # Each is re-applied on upgrade as long as the operator has not edited it:
+    # we remember the checksum we last wrote, so "same as we left it" means ours
+    # to update and anything else means hands off.
+    #
+    #   ocr_prompt.tmpl  The upstream prompt ends with "Use markdown format" and
+    #     a friendly tone, and the model then writes chatter like "Here is the
+    #     transcribed text..." straight INTO the document. Replacing it moved
+    #     text similarity from 82.7% to 90.0% on our test image.
+    #
+    #   tag_prompt.tmpl  The upstream prompt asks for "a comma-separated list"
+    #     and paperless-gpt splits the answer on the ASCII comma only. A model
+    #     answering in Arabic separates with the Arabic comma U+060C, so nothing
+    #     splits and all 4-5 tags arrive as ONE tag named
+    #     "فاتورة ضريبية، مستندات مالية، ..." (NOM-238). Worse, that tag then
+    #     appears in <available_tags> on the next document and teaches the model
+    #     the same separator, so the fault compounds. Ours pins the separator to
+    #     the ASCII comma: 48/48 clean answers across the cloud and local text
+    #     models, against 0/12 before.
+    local shipped name target stamp new_sum cur_sum last_sum
+    for shipped in "$SCRIPT_DIR"/prompts-ar/*.tmpl; do
+        [[ -f $shipped ]] || continue
+        name=$(basename "$shipped")
+        target="$PROMPTS_DIR/$name"
+        stamp="$PROMPTS_DIR/.${name%.tmpl}.installed.sha256"
+        new_sum=$(sha256sum "$shipped" | awk '{print $1}')
+        cur_sum=""; [[ -f $target ]] && cur_sum=$(sha256sum "$target" | awk '{print $1}')
+        last_sum=""; [[ -f $stamp ]] && last_sum=$(cat "$stamp")
         if [[ -z $cur_sum ]]; then
-            cp -f "$shipped" "$ocr"; printf '%s\n' "$new_sum" > "$stamp"
-            print_success "Installed the Arabic-tuned OCR prompt"
+            cp -f "$shipped" "$target"; printf '%s\n' "$new_sum" > "$stamp"
+            print_success "Installed the Arabic-tuned prompt: $name"
         elif [[ $cur_sum == "$new_sum" ]]; then
             printf '%s\n' "$new_sum" > "$stamp"
-            print_success "Arabic-tuned OCR prompt already in place"
+            print_success "Arabic-tuned prompt already in place: $name"
         elif [[ -n $last_sum && $cur_sum == "$last_sum" ]]; then
             # Unchanged since we last wrote it, so it is ours to update.
-            cp -f "$shipped" "$ocr"; printf '%s\n' "$new_sum" > "$stamp"
-            print_success "Updated the Arabic-tuned OCR prompt"
+            cp -f "$shipped" "$target"; printf '%s\n' "$new_sum" > "$stamp"
+            print_success "Updated the Arabic-tuned prompt: $name"
         else
-            print_info "You have edited prompts/ocr_prompt.tmpl — keeping your version."
+            print_info "You have edited prompts/$name — keeping your version."
         fi
-    fi
+    done
 
     # paperless-gpt writes its undo database and settings into these.
     [[ -f "$CONFIG_DIR/settings.json" ]] || echo '{}' > "$CONFIG_DIR/settings.json"
