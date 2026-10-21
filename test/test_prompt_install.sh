@@ -5,10 +5,12 @@
 # The loop is lifted out of install.sh by marker, so this test fails loudly if
 # somebody moves or renames it rather than silently testing a stale copy.
 #
-#   ./test_prompt_install.sh /path/to/install.sh
+#   ./test_prompt_install.sh                      # tests the install.sh beside it
+#   ./test_prompt_install.sh /path/to/install.sh  # tests another copy
 set -uo pipefail
 
-INSTALL=${1:-$(dirname "$0")/install.sh}
+# This script lives in test/; install.sh is one level up at the repo root.
+INSTALL=${1:-$(dirname "$0")/../install.sh}
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
