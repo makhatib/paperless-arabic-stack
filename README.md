@@ -12,7 +12,6 @@ date and tags for you.
 
 ## Quick start
 
-> This installer is intended for public self-hosting. The development repository is currently private, so the clone command below requires repository access. A public download channel has not yet been approved in this task; this command is not a public installation path. Public download instructions will be added after a release is approved and verified.
 
 ```bash
 git clone https://github.com/makhatib/paperless-arabic-stack.git
