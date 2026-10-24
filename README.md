@@ -12,6 +12,7 @@ date and tags for you.
 
 ## Quick start
 
+
 ```bash
 git clone https://github.com/makhatib/paperless-arabic-stack.git
 cd paperless-arabic-stack

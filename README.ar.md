@@ -12,6 +12,7 @@
 
 ## التركيب
 
+
 ```bash
 git clone https://github.com/makhatib/paperless-arabic-stack.git
 cd paperless-arabic-stack
