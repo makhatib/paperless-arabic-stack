@@ -29,8 +29,8 @@ expect "Enter keeps the HomeLab default" \
     "homelab" "$(run '' $'\n' | xargs)"
 
 expect "VPS asks domain, all three subdomains and email" \
-    "vps malkhatib.cloud paperless ai who iam@malkhatib.com" \
-    "$(run '' $'2\nmalkhatib.cloud\npaperless\nai\nwho\niam@malkhatib.com\n')"
+    "vps example.com paperless ai login admin@example.com" \
+    "$(run '' $'2\nexample.com\npaperless\nai\nlogin\nadmin@example.com\n')"
 
 expect "VPS subdomain defaults when Enter is pressed" \
     "vps example.org docs ai-docs auth ops@example.org" \
@@ -45,8 +45,8 @@ expect "Invalid subdomain is asked again" \
     "$(run '' $'2\nexample.org\nbad_label!\ndocs\n\n\nops@example.org\n')"
 
 expect "Unattended: values from the environment are kept" \
-    "vps malkhatib.cloud paperless ai who iam@malkhatib.com" \
-    "$(run 'NONINTERACTIVE=1 PAS_TARGET=vps PAS_DOMAIN=malkhatib.cloud PAS_DOCS_SUB=paperless PAS_AI_SUB=ai PAS_AUTH_SUB=who PAS_LE_EMAIL=iam@malkhatib.com' '')"
+    "vps example.com paperless ai login admin@example.com" \
+    "$(run 'NONINTERACTIVE=1 PAS_TARGET=vps PAS_DOMAIN=example.com PAS_DOCS_SUB=paperless PAS_AI_SUB=ai PAS_AUTH_SUB=login PAS_LE_EMAIL=admin@example.com' '')"
 
 expect "Unattended with nothing set installs HomeLab" \
     "homelab" "$(run 'NONINTERACTIVE=1' '' | xargs)"

@@ -53,14 +53,14 @@ The stack ran on the host's Docker bridge address so no test service was public.
 
 ## Live tests (same host, VPS mode, real domain, cloud AI mode)
 
-Fresh install with `PAS_TARGET=vps`, `PAS_DOMAIN=malkhatib.cloud`, `PAS_DOCS_SUB=paperless`,
-`PAS_AI_SUB=ai`, `PAS_AUTH_SUB=who` (one A record plus two CNAMEs to it), Let's Encrypt production.
+Fresh install on a real public domain, with custom subdomain names for the archive,
+AI and login (one A record plus two CNAMEs to it), Let's Encrypt production.
 
 | Check | Result |
 |---|---|
 | DNS pre-check (CNAMEs followed, no AAAA), first-run install | pass |
 | Let's Encrypt certificates for all three names; HTTP → HTTPS 301; HSTS | pass (checked from outside) |
-| From the internet: anonymous and header-spoofed AI requests redirect to the `who` login | pass |
+| From the internet: anonymous and header-spoofed AI requests redirect to the login subdomain | pass |
 | From the internet: only 22/80/443 open; 5432, 6379, 8000, 8080, 9000, 3000, 11434, 8443, 8444 closed | pass |
 | All 7 browser checks (as above) | pass |
 | Document round trip, then all 7 browser checks again | pass |
