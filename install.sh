@@ -580,26 +580,30 @@ check_port_or_ask() {   # check_port_or_ask VAR "what it is for"
 # STEP 2: Questions
 ################################################################################
 
-ask_config() {
-    step_header "A few questions"
-
-    PAS_TARGET=${PAS_TARGET:-homelab}
+# Where the server lives decides HTTPS (local CA vs Let's Encrypt) and the URLs.
+ask_target() {
+    ask_choice PAS_TARGET "Where is this server?" 1 \
+        "homelab  — at home / on your LAN. HTTPS by IP address with a local certificate you trust on each device." \
+        "vps      — a public server with a domain name. Real Let's Encrypt certificates."
     if [[ $PAS_TARGET == vps ]]; then
-        ask_validated PAS_DOMAIN "Your domain" "" validate_domain "A valid public domain is required."
-        PAS_DOCS_SUB=${PAS_DOCS_SUB:-docs}
-        PAS_AI_SUB=${PAS_AI_SUB:-ai-docs}
-        PAS_AUTH_SUB=${PAS_AUTH_SUB:-auth}
-        local label
-        for label in "$PAS_DOCS_SUB" "$PAS_AI_SUB" "$PAS_AUTH_SUB"; do
-            validate_label "$label" || die "Invalid service subdomain."
+        ask_validated PAS_DOMAIN "Your domain (e.g. example.com)" "" validate_domain "A valid public domain is required."
+        echo "  Three names under ${PAS_DOMAIN} are needed, each with a DNS record pointing to this server."
+        while true; do
+            ask_validated PAS_DOCS_SUB "Subdomain for the document archive" "docs" validate_label "Letters, digits and dashes only."
+            ask_validated PAS_AI_SUB   "Subdomain for Paperless AI"         "ai-docs" validate_label "Letters, digits and dashes only."
+            ask_validated PAS_AUTH_SUB "Subdomain for the login (Authentik)" "auth" validate_label "Letters, digits and dashes only."
+            [[ $PAS_DOCS_SUB != "$PAS_AI_SUB" && $PAS_AUTH_SUB != "$PAS_AI_SUB" && $PAS_AUTH_SUB != "$PAS_DOCS_SUB" ]] && break
+            print_error "The three subdomains must be different."
+            (( NONINTERACTIVE )) && die "non-interactive mode: archive, AI and authentication subdomains must be different."
+            PAS_DOCS_SUB=""; PAS_AI_SUB=""; PAS_AUTH_SUB=""
         done
-        [[ $PAS_DOCS_SUB != "$PAS_AI_SUB" && $PAS_AUTH_SUB != "$PAS_AI_SUB" && $PAS_AUTH_SUB != "$PAS_DOCS_SUB" ]] \
-            || die "Archive, AI and authentication subdomains must be different."
         ask_validated PAS_LE_EMAIL "Email for Let's Encrypt" "" validate_email "A real email address is required."
         email_tld_is_reserved "$PAS_LE_EMAIL" && die "Let's Encrypt requires a real email domain."
         PAS_LE_STAGING=${PAS_LE_STAGING:-no}
         PAS_HTTP_PORT=80
-        print_info "DNS must point docs, AI and auth subdomains to this server; it will be checked before startup."
+        print_info "Create A (or CNAME) records for these before continuing; they are checked before startup:"
+        printf '    %-44s %s\n' "https://${PAS_DOCS_SUB}.${PAS_DOMAIN}" archive \
+            "https://${PAS_AI_SUB}.${PAS_DOMAIN}" AI "https://${PAS_AUTH_SUB}.${PAS_DOMAIN}" login
         if port_in_use 80 && ! port_owned_by_us 80; then die "Port 80 is required for Let's Encrypt."; fi
     elif [[ $PAS_TARGET == homelab ]]; then
         PAS_HTTP_PORT=443
@@ -610,6 +614,11 @@ ask_config() {
     else
         die "PAS_TARGET must be homelab or vps."
     fi
+}
+
+ask_config() {
+    step_header "A few questions"
+    ask_target
 
     # ------------------------------------------------------------ languages --
     echo

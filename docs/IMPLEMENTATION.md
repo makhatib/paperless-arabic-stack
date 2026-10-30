@@ -27,6 +27,7 @@ tested, and what has not. Read it before using this version in production.
 | Provisioning payloads vs. Authentik 2026.8.5 OpenAPI schema | every create/patch body the provisioner sends | pass |
 | `bash test/test_compose.sh` | real Compose parser, HomeLab and VPS × local/cloud/no AI, deterministic regeneration, CA reuse, leaf re-issue on IP change, file modes, no plaintext secrets in `compose.yaml` | pass |
 | `bash test/test_prompt_install.sh` | existing Arabic prompt checks | pass |
+| `bash test/test_target_questions.sh` | HomeLab/VPS question and the three subdomain questions as typed by a person (defaults, invalid and duplicate answers asked again), and unattended values from the environment | pass |
 | `shellcheck -S warning` | `install.sh`, `lib/auth.sh`, `test/test_roundtrip.sh` | pass |
 
 ## Live tests (disposable Ubuntu host, Docker, HomeLab mode, cloud AI mode)

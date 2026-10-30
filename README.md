@@ -72,12 +72,14 @@ bottleneck was the CPU.
 
 ## The two install targets
 
-HomeLab is the default: `https://SERVER-IP` for the archive, `:8443` for Authentik,
+The installer's first question is where the server lives. **HomeLab** (the default):
+`https://SERVER-IP` for the archive, `:8443` for Authentik,
 and `:8444` for AI. Import the generated public CA certificate into each client trust
 store. No external DNS service is required; browser trust cannot be automated remotely.
 
-For VPS, run `PAS_TARGET=vps ./install.sh`. Point the `docs`, `ai-docs`, and `auth`
-A records to your server. Ports 80/443 must be available. Incorrect DNS or untrusted
+**VPS**: choose `vps`, then give your domain and a name for each of the three services
+(defaults `docs`, `ai-docs`, `auth`). Point each name to your server with an A or CNAME
+record before continuing. Ports 80/443 must be available. Incorrect DNS or untrusted
 TLS stops verification; there is no HTTP fallback.
 
 All application/database ports stay private. Only Traefik publishes HTTPS entry points.

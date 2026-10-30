@@ -5,7 +5,8 @@ installer. See [validation status](IMPLEMENTATION.md) for exactly what has been 
 
 ## Install
 
-Run `./install.sh` on a supported Linux machine. HomeLab is the default. Choose your
+Run `./install.sh` on a supported Linux machine. The first question is HomeLab (default)
+or VPS. Choose your
 AI preferences; no Authentik client, provider, redirect URL or token needs copying.
 Arabic OCR, prompt overrides, model choices and existing API integrations are retained.
 Python 3 and OpenSSL are required alongside Docker Compose. Allow additional RAM for
@@ -40,10 +41,11 @@ browser and Paperless container.
 
 ### VPS
 
-Set `PAS_TARGET=vps` when invoking the installer. It asks for the domain and a real
-Let's Encrypt contact email. Create A records for `docs`, `ai-docs`, and `auth` pointing
-to that server's IPv4 address. Alternate labels can be supplied through `PAS_DOCS_SUB`,
-`PAS_AI_SUB`, and `PAS_AUTH_SUB`. DNS is checked before activation; conflicting AAAA
+Answer `vps` to the first question. The installer asks for the domain, a subdomain for
+each service (archive, AI, login; defaults `docs`, `ai-docs`, `auth`) and a real Let's
+Encrypt contact email. Point each name to the server's IPv4 address with an A record, or
+a CNAME to one. For unattended installs (`--yes`), set `PAS_TARGET=vps`, `PAS_DOMAIN`,
+`PAS_DOCS_SUB`, `PAS_AI_SUB`, `PAS_AUTH_SUB` and `PAS_LE_EMAIL` in the environment. DNS is checked before activation; conflicting AAAA
 records are rejected. This initial implementation does not support CDN-proxied DNS or
 IPv6-only deployment. Ports 80 and 443 must be reachable for HTTP-01 validation.
 
