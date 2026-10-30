@@ -12,3 +12,21 @@ backups/
 db/
 config/
 prompts/
+
+# Authentication runtime secrets and generated certificates
+auth/
+PAPERLESS-LOCAL-CA.crt
+compose.secure.*
+__pycache__/
+*.pyc
+node_modules/
+test-results/
+playwright-report/
+
+.installer.lock
+
+# Live test artifacts
+.venv/
+e2e-failure.png
+rt-backup.log
+rt-restore.log

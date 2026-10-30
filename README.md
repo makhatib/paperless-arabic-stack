@@ -20,12 +20,14 @@ chmod +x install.sh
 ./install.sh
 ```
 
-The installer asks a handful of questions, then does everything else: installs Docker
-if it is missing, generates every password, creates the admin user, creates the API
-token and wires Paperless-GPT to Paperless-ngx with no copy/paste, and downloads the
-AI models.
+The installer keeps the existing Arabic OCR and AI setup and automatically provisions
+Authentik, Paperless OIDC, and GPT access control. Credentials are saved privately,
+never printed in unattended logs. HomeLab uses HTTPS with a local CA that you must
+trust on each client; VPS uses Let's Encrypt.
 
-Re-running `./install.sh` is always safe. It keeps your answers and your data.
+Read the [authentication guide](docs/AUTHENTICATION.md) for first login, VPS DNS,
+user management, MFA, recovery, migration and backups. Check the
+[implementation and validation report](docs/IMPLEMENTATION.md) before production use.
 
 ---
 
@@ -37,7 +39,7 @@ Re-running `./install.sh` is always safe. It keeps your answers and your data.
 |---|---|
 | Operating system | Ubuntu 22.04 / 24.04 / 25.04, or Debian 12. Other Linux works if you install Docker yourself. |
 | CPU architecture | amd64 (normal PC/server) or arm64 (Raspberry Pi 5, Apple silicon VM, Ampere VPS) |
-| Root access | Yes — to install Docker and to bind ports 80/443 in VPS mode |
+| Root access | Yes — to install Docker and bind HTTPS ports |
 | Docker | Installed for you if missing (official `get.docker.com` script) |
 | Internet | Needed during install, and on every boot of the Paperless container (it installs the tesseract language pack each time) |
 
@@ -70,33 +72,16 @@ bottleneck was the CPU.
 
 ## The two install targets
 
-### 1. VPS with a domain
+HomeLab is the default: `https://SERVER-IP` for the archive, `:8443` for Authentik,
+and `:8444` for AI. Import the generated public CA certificate into each client trust
+store. No external DNS service is required; browser trust cannot be automated remotely.
 
-- Traefik gets free SSL certificates from Let's Encrypt automatically.
-- You get `https://docs.yourdomain.com` (the archive) and
-  `https://ai-docs.yourdomain.com` (the AI screen).
-- **Create the DNS records first.** The installer shows you exactly what to add and
-  waits for you. Two `A` records pointing at your server's public IP:
+For VPS, run `PAS_TARGET=vps ./install.sh`. Point the `docs`, `ai-docs`, and `auth`
+A records to your server. Ports 80/443 must be available. Incorrect DNS or untrusted
+TLS stops verification; there is no HTTP fallback.
 
-  ```
-  docs.yourdomain.com      A    <your server IP>
-  ai-docs.yourdomain.com   A    <your server IP>
-  ```
-
-  Let's Encrypt verifies those names over port 80, so they must resolve before a
-  certificate can be issued.
-- Paperless-GPT is put behind a password (HTTP basic auth), because it has no login
-  screen of its own. The installer generates that password and shows it to you once.
-- Ports 80 and 443 must be free.
-
-### 2. HomeLab / local machine
-
-- No domain, no SSL. You open it as `http://<machine-ip>:8000`.
-- Paperless-GPT is bound to **127.0.0.1 only** by default, so nothing on your network
-  can reach it. You can opt into LAN exposure, and the installer warns you clearly
-  that this means *no password at all*.
-- Do not port-forward any of this to the internet. If you want access from outside,
-  use a VPN (WireGuard or Tailscale).
+All application/database ports stay private. Only Traefik publishes HTTPS entry points.
+See the [deployment details](docs/AUTHENTICATION.md).
 
 ---
 
@@ -134,6 +119,7 @@ found **25 of 26**. A cloud model found **26 of 26** in 10 seconds.
 |---|---|---|
 | **Local (CPU or GPU)** | `qwen3:8b` | `qwen2.5vl:7b` |
 | **Cloud (OpenRouter)** | `google/gemini-3.1-flash-lite` | same |
+| **Cloud (Google API directly)** | `gemini-3.1-flash-lite` | same |
 
 **Do not use `minicpm-v`.** It is the model suggested in the upstream Paperless-GPT
 docs, and on Arabic it is a disaster: it fell into a repetition loop, produced 7286
@@ -159,97 +145,19 @@ To change models, edit `PAS_TEXT_MODEL` / `PAS_VISION_MODEL` in `.env` and run
 
 Add `--yes` to run without any questions, using the values already in `.env`.
 
-### Changing a setting later
+### Settings, updates, backups and restore
 
-Edit `.env`, then run `./install.sh` again. It rewrites `compose.yaml` from your
-answers and restarts only what changed. Changing a password in `.env` is enough —
-for example `PAS_BASIC_AUTH_USER` or `PAS_BASIC_AUTH_PASS` (the AI screen's
-password box): the installer rebuilds the Traefik hash from the new values and then
-tests the credential against the running site before printing it to you.
+Settings remain in private `.env`. Rerun the installer after changes. `update` takes
+a full safety backup and refuses to proceed on backup failure. Backups include
+Authentik identities, OIDC secrets, local CA/ACME state, documents and both databases.
+Applications pause briefly for consistency. Store backups privately and encrypted off-host.
 
-### Updating to a newer release
+Restore preserves existing passwords and restores identity state together with its
+keys. Read the [migration and recovery procedures](docs/AUTHENTICATION.md) before
+restoring, especially when using a legacy backup or moving to another server.
 
-Image versions are **pinned** in `.env` (`PAS_V_NGX`, `PAS_V_GPT`, …) so that
-`update` is reproducible and never surprises you. To move to a newer release:
-
-```bash
-nano .env                    # change PAS_V_NGX=3.3.0 to the version you want
-./install.sh update          # takes a database backup first, then pulls and restarts
-```
-
-### Backups
-
-`./install.sh backup` produces one `.tar.gz` in `./backups/` containing:
-
-- a `pg_dump` of the database
-- the `media` volume (your original files, archived PDFs, thumbnails)
-- the `data` volume (search index, classifier model)
-- `prompts/`, `config/`, `db/`, `export/`, `compose.yaml` and `.env`
-- a `MANIFEST` that records how many documents were in the database
-
-**The archive contains `.env`, which contains every password.** Keep it private, and
-copy it off the machine — a backup that only exists on the same server is not a backup.
-
-### Restoring
-
-```bash
-./install.sh restore backups/paperless-ar-backup-YYYYMMDD-HHMMSS.tar.gz
-```
-
-Restore replaces the database and all documents, so it checks the backup **before**
-it touches anything, and it refuses to pretend:
-
-1. the archive must unpack, and the dump inside it must be valid gzip and end with
-   PostgreSQL's own end-of-dump marker — a truncated or half-copied backup is
-   rejected while your install is still untouched;
-2. the current database is dumped to `backups/pre-restore-<timestamp>.sql.gz` first;
-3. the dump is loaded with `ON_ERROR_STOP=1`, so the first failed statement stops it
-   instead of being printed and skipped;
-4. afterwards the restored document count is compared with the `MANIFEST`. If it does
-   not match, the restore is treated as failed.
-
-If any of that fails, the previous database is put back from the safety dump, the
-error log is kept in `backups/failed-restore-<timestamp>.log` (mode `600` — it can
-quote rows out of the database), your documents are left alone, and the command exits
-non-zero. `--no-safety-dump` skips step 2 if you really want to.
-
-#### Your password after a restore
-
-**A restore never changes your admin password.** If you changed it inside Paperless
-— and you should, especially if the installer's output was ever on screen in front
-of anyone — your backup holds the password you chose, and that is the password you
-log in with afterwards. The installer says so, and warns that `PAS_ADMIN_PASSWORD`
-in `.env` is then out of date.
-
-If you have genuinely lost that password, you can overwrite it with the one in
-`.env`:
-
-```bash
-./install.sh restore <file> --reset-admin-password
-```
-
-Interactively it just asks, and the default answer is **no**.
-
-The API token is different and is lined up automatically: the token lives in the
-database, so after a restore the new one is copied into `.env` and Paperless-GPT is
-restarted with it. No copy/paste, and nothing of yours is overwritten.
-
-**Restoring onto a different machine** therefore works: install normally first
-(`./install.sh`), then restore, then log in with the password from the machine the
-backup came from — or add `--reset-admin-password` if that password is gone.
-
-Test your restore. `./install.sh restore <file>` is there for exactly that, and we
-test it on every release of this script — including with deliberately broken backups.
-
-Each restore leaves a `pre-restore-*.sql.gz` behind, and each failed one a
-`failed-restore-*.log`. Both can contain your data, so keep `backups/` private.
-
-Each restore keeps the newest 5 of each of those two and deletes the older ones,
-so restore drills cannot quietly fill the disk with database dumps. Set
-`PAS_BACKUP_KEEP=<n>` in `.env` to keep a different number, or
-`PAS_BACKUP_KEEP=0` to never delete anything. The backups you make yourself —
-`db-*.sql.gz` and `paperless-ar-backup-*.tar.gz` — are never deleted, whatever
-`PAS_BACKUP_KEEP` says.
+`./install.sh auth-recover` creates a private, time-limited Authentik recovery link.
+Initial credentials are in `auth/initial-credentials.txt`, mode 600.
 
 ---
 
@@ -336,24 +244,18 @@ numbers.** Treat every extracted amount as a suggestion until a human confirms i
 
 ## Security
 
-Read this part. It is short.
+Authentik provides OIDC for Paperless and ForwardAuth for GPT. GPT access fails closed
+when authentication is unavailable. No Docker socket is mounted. Internal networks
+separate data services and proxy paths; outbound access does not join all services
+onto one shared network. Existing Paperless local login remains for recovery.
 
-- **Paperless-GPT has no authentication of its own.** Anyone who can reach its port
-  sees your documents. That is why VPS mode always puts basic auth in front of it and
-  HomeLab mode binds it to `127.0.0.1`.
-- **`.env` holds every password** and is created with `chmod 600`. It is in
-  `.gitignore`. Never commit it, never paste it into a chat or an issue.
-- **Your backups contain `.env`.** Same rules.
-- **In VPS mode, Traefik mounts the Docker socket read-only.** This is the standard
-  Traefik setup and is what lets it read the routing labels. Be aware that read access
-  to the Docker socket is still a privileged thing: anyone who gets code execution
-  inside the Traefik container can enumerate your containers. If you want to tighten
-  this, put a `docker-socket-proxy` in front of it.
-- **Cloud mode sends your documents to a third party** — the page image and the
-  extracted text of everything you process. Do not use it for documents you are not
-  allowed to send off your server. Local mode sends nothing anywhere.
-- **HomeLab mode is plain HTTP with no encryption.** Do not port-forward it. Use a VPN.
-- The installer generates every secret randomly. It never ships a default password.
+GPT uses a shared privileged Paperless API token. Only trusted AI operators should
+receive access: ForwardAuth does not give GPT per-user document permissions.
+Open registration and implicit email account linking are disabled. Credentials and
+backups are private files; never share `.env`, `auth/`, or unredacted container logs.
+Cloud AI still sends processed documents to the selected provider.
+
+See [security architecture and limitations](docs/AUTHENTICATION.md).
 
 ---
 
@@ -368,7 +270,9 @@ Read this part. It is short.
 | tika | `apache/tika:3.3.1.0` | text extraction from Office files |
 | paperless-gpt | `icereed/paperless-gpt:v0.29.0` | the AI layer |
 | ollama | `ollama/ollama:0.40.2` | runs local models (local AI only) |
-| traefik | `traefik:v3.7.11` | TLS and routing (VPS only) |
+| traefik | `traefik:v3.7.16` | HTTPS routing in both modes |
+| authentik / auth-worker | `ghcr.io/goauthentik/server:2026.8.5` | SSO, policies and embedded outpost |
+| auth-db | `postgres:18.6` | isolated identity database |
 
 All versions are pinned. Nothing uses `latest`.
 
@@ -396,7 +300,12 @@ YouTube: https://youtube.com/@malkhatib
 
 ---
 
-## Testing notes
+## Historical Arabic-processing tests
+
+The following results describe the original installer, before Authentik integration.
+They are not evidence for the new authentication paths. Current results are in
+[the implementation report](docs/IMPLEMENTATION.md).
+
 
 This installer was tested by running it on **bare Ubuntu 24.04 containers with no
 Docker and no Compose installed**, once per target, and then re-running it to

@@ -19,9 +19,12 @@
 #   unless you explicitly choose the cloud AI option.
 ################################################################################
 
+# shellcheck disable=SC2034 # Settings persisted through indirect expansion in env_set.
+set +x  # Secrets must never reach shell traces, even with bash -x.
 set -Eeuo pipefail
+umask 077
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="2.0.0-dev"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
@@ -46,7 +49,7 @@ DEF_V_POSTGRES="18.6"
 DEF_V_VALKEY="9.1.2-alpine"
 DEF_V_GOTENBERG="8.37.0"
 DEF_V_TIKA="3.3.1.0"
-DEF_V_TRAEFIK="v3.7.11"
+DEF_V_TRAEFIK="v3.7.16"
 
 # Measured defaults (see the Phase 2 report): these two models are the ones that
 # actually work on Arabic documents. Do NOT swap the vision model for minicpm-v.
@@ -83,9 +86,10 @@ die() { print_error "$1"; exit 1; }
 
 on_error() {
     local code=$? line=${1:-?}
+    if declare -F auth_resume >/dev/null; then auth_resume || true; fi
     echo
     print_error "Something went wrong (exit $code, line $line)."
-    echo "  Nothing was deleted. Your settings are still in ./.env"
+    echo "  The operation did not complete. Settings are in ./.env; rollback backups are in ./backups."
     echo "  Look at the logs:   docker compose logs --tail 80"
     echo "  Then run again:     ./install.sh      (it is safe to re-run)"
     exit "$code"
@@ -541,10 +545,20 @@ precheck() {
 # whole thing non-idempotent -- which is exactly what happened before this check
 # existed: the second ./install.sh aborted with "port 8000 is busy".
 port_owned_by_us() {
-    local port=$1 mine
-    mine=$(docker ps --filter "label=com.docker.compose.project=${COMPOSE_PROJECT}" \
-             --format '{{.Ports}}' 2>/dev/null || true)
-    [[ -n $mine ]] && contains "$mine" ":${port}->"
+    local port=$1 ids
+    ids=$(docker ps -q --filter "label=com.docker.compose.project=${COMPOSE_PROJECT}")
+    [[ -n $ids ]] || return 1
+    # Docker's human-readable Ports column compresses consecutive ports into ranges.
+    # Inspect structured bindings so reruns recognize 8443-8444 correctly.
+    # shellcheck disable=SC2086
+    docker inspect --format '{{json .NetworkSettings.Ports}}' $ids | python3 -c '
+import json,sys
+wanted=sys.argv[1]
+owned=any(binding.get("HostPort")==wanted
+          for line in sys.stdin for bindings in (json.loads(line) or {}).values()
+          for binding in (bindings or []))
+sys.exit(0 if owned else 1)
+' "$port"
 }
 
 check_port_or_ask() {   # check_port_or_ask VAR "what it is for"
@@ -569,101 +583,32 @@ check_port_or_ask() {   # check_port_or_ask VAR "what it is for"
 ask_config() {
     step_header "A few questions"
 
-    # ---------------------------------------------------------------- target --
-    echo "Where are you installing this?"
-    ask_choice PAS_TARGET "Pick your setup" 2 \
-        "vps      — a VPS with a real domain name (free SSL, reachable from anywhere)" \
-        "homelab  — a HomeLab / local machine (plain ports on your own network)"
-
+    PAS_TARGET=${PAS_TARGET:-homelab}
     if [[ $PAS_TARGET == vps ]]; then
-        echo
-        print_info "VPS mode: Traefik will get free SSL certificates from Let's Encrypt."
-        ask_validated PAS_DOMAIN   "Your domain (e.g. example.com)" "" validate_domain \
-            "That does not look like a domain. Example: example.com"
-        ask_validated PAS_DOCS_SUB "Subdomain for Paperless-ngx (your archive)" "docs" validate_label \
-            "Use letters, numbers and dashes only. Example: docs"
-        ask_validated PAS_AI_SUB   "Subdomain for Paperless-GPT (the AI screen)" "ai-docs" validate_label \
-            "Use letters, numbers and dashes only. Example: ai-docs"
-        while true; do
-            ask_validated PAS_LE_EMAIL "Your email (Let's Encrypt uses it for expiry warnings)" "" validate_email \
-                "That does not look like an email address."
-            if ! email_tld_is_reserved "$PAS_LE_EMAIL"; then break; fi
-            print_error "Let's Encrypt will reject '$PAS_LE_EMAIL' — '.${PAS_LE_EMAIL##*.}' is a reserved domain ending."
-            echo "  Use a real address you can receive mail at (gmail.com, your own domain, ...)."
-            (( NONINTERACTIVE )) && die "non-interactive mode: PAS_LE_EMAIL must use a real public domain"
-            PAS_LE_EMAIL=""
+        ask_validated PAS_DOMAIN "Your domain" "" validate_domain "A valid public domain is required."
+        PAS_DOCS_SUB=${PAS_DOCS_SUB:-docs}
+        PAS_AI_SUB=${PAS_AI_SUB:-ai-docs}
+        PAS_AUTH_SUB=${PAS_AUTH_SUB:-auth}
+        local label
+        for label in "$PAS_DOCS_SUB" "$PAS_AI_SUB" "$PAS_AUTH_SUB"; do
+            validate_label "$label" || die "Invalid service subdomain."
         done
-        ask_yes_no PAS_LE_STAGING "Use the Let's Encrypt STAGING server? (only for testing — browsers will warn)" N
-
-        # --- the DNS gate: nothing works without these two records ---
-        local srv_ip
-        srv_ip=$(curl -fsS --max-time 8 https://api.ipify.org 2>/dev/null \
-               || curl -fsS --max-time 8 https://icanhazip.com 2>/dev/null | tr -d '\n' \
-               || echo "")
-        echo
-        print_header "⚠  Create these DNS records FIRST"
-        echo "In your DNS provider, add two ${BOLD}A${NC} records:"
-        echo
-        printf '    %-34s A    %s\n' "${PAS_DOCS_SUB}.${PAS_DOMAIN}" "${srv_ip:-<this server public IP>}"
-        printf '    %-34s A    %s\n' "${PAS_AI_SUB}.${PAS_DOMAIN}"   "${srv_ip:-<this server public IP>}"
-        echo
-        if [[ -z $srv_ip ]]; then
-            print_warning "I could not detect this server's public IP. Use the IP your VPS provider gave you."
-        else
-            print_info "Detected public IP of this server: ${BOLD}${srv_ip}${NC}"
-        fi
-        echo "Let's Encrypt checks those names over port 80, so the records must exist and point here"
-        echo "${BOLD}before${NC} the certificate can be issued. DNS can take a few minutes to spread."
-        echo
-        local cont=Y
-        if ! (( NONINTERACTIVE )); then
-            read -r -p "${CYAN}Have you created both records? [Y/n] (n = stop here, I will wait): ${NC}" cont || true
-            if [[ ${cont:-Y} =~ ^[Nn] ]]; then
-                print_info "No problem. Create the records, then run ./install.sh again — nothing has been changed."
-                exit 0
-            fi
-        fi
-
-        # Traefik needs 80 and 443. Check now: finding out at `docker compose up`
-        # instead means a raw "address already in use" with no explanation.
-        local p
-        for p in 80 443; do
-            if port_in_use "$p" && ! port_owned_by_us "$p"; then
-                print_error "Port $p is already used by something else (often Apache, nginx or another Traefik)."
-                echo "  Traefik needs both 80 and 443 to get a certificate and serve HTTPS."
-                echo "  Find out what has it:   sudo ss -ltnp | grep ':$p'"
-                echo "  Then stop that service and run ./install.sh again."
-                die "Cannot continue while port $p is taken."
-            fi
-            print_success "Port $p is available for Traefik"
-        done
-
-        # Paperless-GPT has no login of its own, so it always gets basic auth in VPS mode.
-        PAS_BASIC_AUTH_USER=${PAS_BASIC_AUTH_USER:-admin}
-        print_info "Paperless-GPT has no login screen of its own, so it will sit behind a password (basic auth)."
-        ask PAS_BASIC_AUTH_USER "Username for that password box" "admin"
-
+        [[ $PAS_DOCS_SUB != "$PAS_AI_SUB" && $PAS_AUTH_SUB != "$PAS_AI_SUB" && $PAS_AUTH_SUB != "$PAS_DOCS_SUB" ]] \
+            || die "Archive, AI and authentication subdomains must be different."
+        ask_validated PAS_LE_EMAIL "Email for Let's Encrypt" "" validate_email "A real email address is required."
+        email_tld_is_reserved "$PAS_LE_EMAIL" && die "Let's Encrypt requires a real email domain."
+        PAS_LE_STAGING=${PAS_LE_STAGING:-no}
         PAS_HTTP_PORT=80
+        print_info "DNS must point docs, AI and auth subdomains to this server; it will be checked before startup."
+        if port_in_use 80 && ! port_owned_by_us 80; then die "Port 80 is required for Let's Encrypt."; fi
+    elif [[ $PAS_TARGET == homelab ]]; then
+        PAS_HTTP_PORT=443
+        PAS_GPT_BIND=127.0.0.1
+        PAS_GPT_PORT=8444
+        PAS_GPT_LAN=no
+        print_info "HomeLab: HTTPS by LAN IP. Trust the generated local CA on each client device."
     else
-        echo
-        print_info "HomeLab mode: no domain and no SSL. You open it by IP and port on your own network."
-        ask_validated PAS_HTTP_PORT "Port for Paperless-ngx (your archive)" "8000" validate_port \
-            "That is not a valid port number (1-65535)."
-        check_port_or_ask PAS_HTTP_PORT "Paperless-ngx"
-
-        echo
-        print_warning "Paperless-GPT has NO login screen. Anyone who can reach its port sees your documents."
-        ask_yes_no PAS_GPT_LAN "Expose Paperless-GPT to your whole local network? (No = this machine only, safest)" N
-        if is_yes "$PAS_GPT_LAN"; then
-            PAS_GPT_BIND="0.0.0.0"
-            print_warning "Paperless-GPT will be reachable by every device on your LAN, with no password."
-        else
-            PAS_GPT_BIND="127.0.0.1"
-            print_success "Paperless-GPT will be bound to 127.0.0.1 — only this machine can open it."
-        fi
-        ask_validated PAS_GPT_PORT "Port for Paperless-GPT" "8080" validate_port \
-            "That is not a valid port number (1-65535)."
-        check_port_or_ask PAS_GPT_PORT "Paperless-GPT"
+        die "PAS_TARGET must be homelab or vps."
     fi
 
     # ------------------------------------------------------------ languages --
@@ -795,7 +740,9 @@ ask_config() {
                 ask PAS_CLOUD_MODEL "Model name" "gpt-4o-mini" ;;
             gemini)
                 PAS_CLOUD_BASE_URL="https://generativelanguage.googleapis.com/v1beta/openai"
-                ask PAS_CLOUD_MODEL "Model name" "gemini-2.5-flash" ;;
+                # Same model we measured via OpenRouter, under Google's own ID. gemini-2.5-flash
+                # is no longer offered to new API accounts.
+                ask PAS_CLOUD_MODEL "Model name" "gemini-3.1-flash-lite" ;;
             custom)
                 ask PAS_CLOUD_BASE_URL "Base URL of the OpenAI-compatible endpoint" "https://"
                 ask PAS_CLOUD_MODEL    "Model name" "" ;;
@@ -857,39 +804,10 @@ write_env() {
     PAPERLESS_DBPASS=${PAPERLESS_DBPASS:-$(generate_secret 32)}
     PAS_ADMIN_PASSWORD=${PAS_ADMIN_PASSWORD:-$(generate_secret 20)}
 
-    if [[ $PAS_TARGET == vps ]]; then
-        PAS_BASIC_AUTH_PASS=${PAS_BASIC_AUTH_PASS:-$(generate_secret 20)}
-
-        # The hash is DERIVED from the user + password, so it MUST be rebuilt
-        # whenever either of them changes. Editing .env and re-running is the
-        # documented way to change a setting; the first version only built the
-        # hash when it was empty, so after an edit the installer printed
-        # credentials that Traefik then rejected with 401, with no error.
-        # PAS_BASIC_AUTH_FP records which user/password the stored hash belongs
-        # to -- a salted hash cannot be compared against a password directly,
-        # and re-hashing on every run would churn compose.yaml.
-        local want_fp; want_fp=$(auth_fingerprint "$PAS_BASIC_AUTH_USER" "$PAS_BASIC_AUTH_PASS")
-        if [[ -z ${PAS_BASIC_AUTH_HASH:-} ]]; then
-            PAS_BASIC_AUTH_HASH=$(htpasswd_line "$PAS_BASIC_AUTH_USER" "$PAS_BASIC_AUTH_PASS")
-            PAS_BASIC_AUTH_FP=$want_fp
-        elif [[ -z ${PAS_BASIC_AUTH_FP:-} ]]; then
-            # An .env from an older installer has a hash but no marker, so there
-            # is no way to tell what it belongs to. Rebuild it once; from then
-            # on re-runs leave it alone.
-            print_info "Rebuilding the AI screen's password hash once, so it can be checked from now on."
-            PAS_BASIC_AUTH_HASH=$(htpasswd_line "$PAS_BASIC_AUTH_USER" "$PAS_BASIC_AUTH_PASS")
-            PAS_BASIC_AUTH_FP=$want_fp
-        elif [[ ${PAS_BASIC_AUTH_FP} != "$want_fp" ]]; then
-            print_info "The AI screen's username or password changed in .env — rebuilding its hash."
-            PAS_BASIC_AUTH_HASH=$(htpasswd_line "$PAS_BASIC_AUTH_USER" "$PAS_BASIC_AUTH_PASS")
-            PAS_BASIC_AUTH_FP=$want_fp
-        fi
-    fi
-
     [[ -f $ENV_FILE ]] || { : > "$ENV_FILE"; chmod 600 "$ENV_FILE"; }
 
     local k
-    for k in PAS_TARGET PAS_DOMAIN PAS_DOCS_SUB PAS_AI_SUB PAS_LE_EMAIL PAS_LE_STAGING \
+    for k in PAS_TARGET PAS_DOMAIN PAS_DOCS_SUB PAS_AI_SUB PAS_AUTH_SUB PAS_LE_EMAIL PAS_LE_STAGING \
              PAS_HTTP_PORT PAS_GPT_BIND PAS_GPT_PORT PAS_GPT_LAN \
              PAS_DOC_LANG PAS_OCR_LANGUAGES PAS_OCR_LANGUAGE PAS_TZ \
              PAS_AI_MODE PAS_OLLAMA_MODE PAS_OLLAMA_URL PAS_TEXT_MODEL PAS_VISION_MODEL PAS_GPU \
@@ -912,35 +830,6 @@ write_env() {
 
     load_env
     print_success "Settings and passwords written to .env (chmod 600, never commit this file)"
-}
-
-# Which user/password the stored basic-auth hash was built from. Not a secret
-# in its own right: .env already holds that password in clear text, next to it.
-# sha256sum (coreutils) or openssl is present on every supported system; the
-# last resort still changes whenever the user or password length changes.
-auth_fingerprint() {
-    local s="$1:$2"
-    if command_exists sha256sum; then
-        printf '%s' "$s" | sha256sum | cut -d' ' -f1
-    elif command_exists openssl; then
-        printf '%s' "$s" | openssl dgst -sha256 | awk '{print $NF}'
-    else
-        printf 'len-%d-%d' "${#1}" "${#2}"
-    fi
-}
-
-# A basic-auth line "user:hash" that Traefik accepts.
-htpasswd_line() {
-    local user=$1 pass=$2 hash=""
-    if command_exists htpasswd; then
-        hash=$(htpasswd -nbB "$user" "$pass" 2>/dev/null | cut -d: -f2-)
-    elif command_exists openssl; then
-        hash=$(openssl passwd -apr1 "$pass")
-    else
-        hash=$(docker run --rm httpd:2.4-alpine htpasswd -nbB "$user" "$pass" 2>/dev/null | cut -d: -f2- | tr -d '\r')
-    fi
-    [[ -n $hash ]] || die "Could not create the password hash for basic auth."
-    printf '%s:%s' "$user" "$hash"
 }
 
 ################################################################################
@@ -1219,7 +1108,7 @@ YAML
         if [[ $PAS_TARGET == vps ]]; then
             # $ must be doubled in a compose label, otherwise compose eats the
             # apr1/bcrypt hash and basic auth silently never matches.
-            local hash_escaped=${PAS_BASIC_AUTH_HASH//\$/\$\$}
+            local hash_escaped="disabled-replaced-by-authentik"
             cat >> "$tmp" <<YAML
     labels:
       - traefik.enable=true
@@ -1303,27 +1192,13 @@ YAML
     esac
     load_env
 
-    # Validate before replacing the live file: a broken compose.yaml should
-    # never land on disk.
-    if [[ -f $COMPOSE_FILE ]]; then
-        cp -f "$COMPOSE_FILE" "$SCRIPT_DIR/.compose.yaml.prev"
-    fi
-    mv -f "$tmp" "$COMPOSE_FILE"
-    if ! dc --dry-run config >/dev/null 2>&1; then
-        # PAPERLESS_API_TOKEN is legitimately missing on a first install, so a
-        # complaint about only that one is expected.
-        local err; err=$(dc config 2>&1 || true)
-        if ! grep -q 'PAPERLESS_API_TOKEN' <<<"$err"; then
-            if [[ -f $SCRIPT_DIR/.compose.yaml.prev ]]; then
-                mv -f "$SCRIPT_DIR/.compose.yaml.prev" "$COMPOSE_FILE"
-                print_warning "Restored the previous compose.yaml."
-            fi
-            echo "$err" >&2
-            die "The generated compose.yaml is not valid. Nothing was started."
-        fi
-    fi
-    rm -f "$SCRIPT_DIR/.compose.yaml.prev"
-    print_success "compose.yaml written and validated"
+    local secure; secure=$(mktemp "$SCRIPT_DIR/compose.secure.XXXXXX")
+    auth_render "$tmp" "$secure"
+    rm -f "$tmp"
+    mv -f "$secure" "$COMPOSE_FILE"
+    chmod 600 "$COMPOSE_FILE"
+    print_success "Secure compose.yaml written and validated"
+
 }
 
 ################################################################################
@@ -1425,7 +1300,7 @@ pull_images() {
 start_core() {
     step_header "Starting Paperless-ngx"
     dc up -d "${CORE_SERVICES[@]}"
-    [[ $PAS_TARGET == vps ]] && dc up -d traefik
+    dc up -d traefik
     print_info "Waiting for Paperless-ngx to finish its first-time setup..."
     if [[ $PAS_OCR_LANGUAGES != eng ]]; then
         print_info "(It installs the tesseract language pack on every boot, so the first boot is the slow one.)"
@@ -1479,9 +1354,7 @@ else:
 
     if [[ -z $token ]]; then
         print_error "Could not create the API token automatically."
-        echo "  Open Paperless-ngx, go to Settings -> API Tokens, create one, then put it in .env as:"
-        echo "      PAPERLESS_API_TOKEN=<the token>"
-        echo "  and run ./install.sh again."
+        echo "  Check the existing Paperless administrator and re-run ./install.sh; credentials are provisioned automatically."
         exit 1
     fi
     env_set PAPERLESS_API_TOKEN "$token"
@@ -1628,14 +1501,6 @@ verify() {
         ok=0
     fi
 
-    if [[ $PAS_TARGET == homelab ]]; then
-        if curl -fsS --max-time 5 "http://127.0.0.1:${PAS_HTTP_PORT}" >/dev/null 2>&1; then
-            print_success "Reachable on this machine at http://127.0.0.1:${PAS_HTTP_PORT}"
-        else
-            print_error "Not reachable on port ${PAS_HTTP_PORT}"; ok=0
-        fi
-    fi
-
     if [[ $PAS_AI_MODE != none ]]; then
         local gpt_running; gpt_running=$(dc ps --status running --services 2>/dev/null || true)
         if contains_line "$gpt_running" 'paperless-gpt'; then
@@ -1668,194 +1533,12 @@ verify() {
         fi
     fi
 
-    if [[ $PAS_TARGET == vps ]]; then
-        local t_code; t_code=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' "http://127.0.0.1/" 2>/dev/null || true)
-        if [[ $t_code =~ ^(200|30[0-9]|40[0-9])$ ]]; then
-            print_success "Traefik is answering on port 80 (HTTP $t_code)"
-        else
-            print_warning "Traefik did not answer on port 80 yet."
-        fi
-
-        # The basic-auth password is the one credential this installer prints
-        # that it does NOT get back from a running service, so test it for real
-        # instead of trusting the hash in .env. --resolve + -k keeps this on
-        # 127.0.0.1 and works before the certificate is issued. The header is
-        # built by hand on purpose: `curl -u` through a nested shell loses the
-        # credential and reports a false 401 (measured in review).
-        if [[ $PAS_AI_MODE != none && -n ${PAS_BASIC_AUTH_HASH:-} ]]; then
-            local ai_host="${PAS_AI_SUB}.${PAS_DOMAIN}" cred c_no c_yes
-            cred=$(printf '%s:%s' "$PAS_BASIC_AUTH_USER" "$PAS_BASIC_AUTH_PASS" | base64 | tr -d '\n')
-            c_no=$(curl -sk --max-time 8 -o /dev/null -w '%{http_code}' \
-                     --resolve "${ai_host}:443:127.0.0.1" "https://${ai_host}/" 2>/dev/null || true)
-            c_yes=$(curl -sk --max-time 8 -o /dev/null -w '%{http_code}' \
-                      -H "Authorization: Basic ${cred}" \
-                      --resolve "${ai_host}:443:127.0.0.1" "https://${ai_host}/" 2>/dev/null || true)
-            if [[ $c_no == 401 && $c_yes =~ ^(200|30[0-9])$ ]]; then
-                print_success "AI screen asks for the password (401) and the printed one works (HTTP $c_yes)"
-            elif [[ $c_yes == 401 ]]; then
-                print_error "The AI screen rejects the password this installer is about to print."
-                echo "      Delete the PAS_BASIC_AUTH_HASH line from .env and run ./install.sh again."
-                ok=0
-            elif [[ $c_no != 401 && $c_no =~ ^[0-9]{3}$ && $c_no != 000 ]]; then
-                print_error "The AI screen answered HTTP $c_no without any password — it is NOT protected."
-                ok=0
-            else
-                print_warning "Could not reach the AI screen through Traefik yet (got '$c_no'/'$c_yes')."
-                echo "      Normal if the certificate is still being issued. Re-check with ./install.sh status"
-            fi
-        fi
-
-        print_info "Certificates take 1-3 minutes after the DNS records resolve. Watch them with:"
-        echo "      docker compose logs -f traefik | grep -i acme"
-    fi
-
-    (( ok )) || print_warning "Some checks failed. The summary below still shows you where to look."
-    return 0
+    (( ok )) || die "Application verification failed; installation is not complete."
+    auth_verify
 }
 
-summary() {
-    local docs_url ai_url
-    if [[ $PAS_TARGET == vps ]]; then
-        docs_url="https://${PAS_DOCS_SUB}.${PAS_DOMAIN}"
-        ai_url="https://${PAS_AI_SUB}.${PAS_DOMAIN}"
-    else
-        local ip; ip=$(lan_ip)
-        docs_url="http://${ip:-127.0.0.1}:${PAS_HTTP_PORT}"
-        if [[ ${PAS_GPT_BIND:-127.0.0.1} == 127.0.0.1 ]]; then
-            ai_url="http://127.0.0.1:${PAS_GPT_PORT}  (this machine only)"
-        else
-            ai_url="http://${ip:-127.0.0.1}:${PAS_GPT_PORT}"
-        fi
-    fi
 
-    print_header "🎉 Done!"
-
-    echo "${GREEN}${BOLD}Open these in your browser${NC}"
-    echo "${GREEN}═══════════════════════════════════════════${NC}"
-    printf '  • %-22s %s%s%s\n' "Your archive:" "$GREEN" "$docs_url" "$NC"
-    [[ $PAS_AI_MODE != none ]] && printf '  • %-22s %s%s%s\n' "AI screen:" "$GREEN" "$ai_url" "$NC"
-    echo
-
-    echo "${CYAN}${BOLD}Login${NC}"
-    printf '  Username: %s\n' "$PAS_ADMIN_USER"
-    # Only print a password the database confirmed. verify() asked; if it came
-    # back PAS_PW_DIFFERS the user changed it themselves and .env is stale, so
-    # the value here would be a password that does not log in.
-    case $PAS_PW_STATE in
-        PAS_PW_DIFFERS)
-            printf '  Password: %syou changed this yourself%s\n' "$BOLD" "$NC"
-            echo "            Your own password is the live one. The value in .env is out of date."
-            ;;
-        PAS_PW_NOUSER)
-            printf '  Password: %s—%s  (there is no %s user yet, see the error above)\n' \
-                "$BOLD" "$NC" "$PAS_ADMIN_USER"
-            ;;
-        *)
-            printf '  Password: %s%s%s\n' "$BOLD" "$PAS_ADMIN_PASSWORD" "$NC"
-            ;;
-    esac
-    if [[ $PAS_TARGET == vps && $PAS_AI_MODE != none ]]; then
-        echo
-        echo "  The AI screen asks for a second, separate password first:"
-        printf '  Username: %s\n' "$PAS_BASIC_AUTH_USER"
-        printf '  Password: %s%s%s\n' "$BOLD" "$PAS_BASIC_AUTH_PASS" "$NC"
-    fi
-    if [[ $PAS_PW_STATE == PAS_PW_DIFFERS ]]; then
-        echo "  ${YELLOW}./.env still holds the original install password — it is no longer the login.${NC}"
-        echo "  ${YELLOW}Keep that file safe anyway: the other secrets in it are current.${NC}"
-    else
-        echo "  ${YELLOW}All of this is also saved in ./.env — keep that file safe and never commit it.${NC}"
-    fi
-    echo
-
-    if [[ $PAS_AI_MODE != none ]]; then
-        echo "${CYAN}${BOLD}The four tags, and what each one does${NC}"
-        echo "  Put a tag on a document in Paperless-ngx and the AI picks it up."
-        echo
-        printf '  %-28s %s\n' "paperless-gpt"          "Suggest title/sender/date/tags, and WAIT for you to approve."
-        printf '  %-28s %s\n' "paperless-gpt-auto"     "Same, but save it immediately without asking."
-        printf '  %-28s %s\n' "paperless-gpt-ocr-auto" "Re-read the page with the vision model. Use this on photos and scans."
-        printf '  %-28s %s\n' "paperless-gpt-failed"   "Added automatically when something fails. Nothing for you to do."
-        echo
-        print_warning "Only use ocr-auto on images and scans. A text PDF is already read perfectly and for free."
-        echo
-        echo "${CYAN}${BOLD}Your first test — 3 steps${NC}"
-        printf '  %s1.%s Take a photo of any invoice and drop the file into: %s./consume/%s\n' "$BOLD" "$NC" "$BOLD" "$NC"
-        echo "     (or upload it from the web page). It appears in a few seconds."
-        printf '  %s2.%s Open the document, add the tag %spaperless-gpt-ocr-auto%s, save.\n' "$BOLD" "$NC" "$BOLD" "$NC"
-        if [[ $PAS_AI_MODE == local && $PAS_GPU != yes ]]; then
-            echo "     Now wait. On a CPU this takes about 6-8 minutes for one photo. That is normal."
-        else
-            echo "     It usually finishes in well under a minute."
-        fi
-        printf '  %s3.%s Re-open the document and read the text. Then search for a number that is in it.\n' "$BOLD" "$NC"
-        echo "     Before the AI, Arabic phone photos gave us 1 number out of 26. After, 25 out of 26."
-        echo
-    fi
-
-    echo "${CYAN}${BOLD}Everyday commands${NC}"
-    printf '  %-26s %s\n' "./install.sh status"    "what is running, and where"
-    printf '  %-26s %s\n' "./install.sh update"    "pull the images again and restart"
-    printf '  %-26s %s\n' "./install.sh backup"    "save DB + documents + prompts into ./backups"
-    printf '  %-26s %s\n' "./install.sh uninstall" "stop it all (your documents are kept)"
-    printf '  %-26s %s\n' "docker compose logs -f" "watch the logs live"
-    echo
-
-    if [[ $PAS_TARGET == vps ]]; then
-        print_warning "SSL certificates need 1-3 minutes, and the DNS records must already point here."
-        echo "  Watch:  docker compose logs -f traefik | grep -i acme"
-        is_yes "${PAS_LE_STAGING:-no}" && print_warning "You chose the STAGING server: browsers WILL show a warning. That is expected."
-    else
-        print_warning "This is HTTP on your local network, with no encryption."
-        echo "  Do not port-forward it to the internet. If you need remote access, use a VPN (WireGuard/Tailscale)."
-    fi
-    echo
-    echo "${YELLOW}${BOLD}Known limit you should hear from us, not discover later:${NC}"
-    echo "  An English invoice number printed inside an Arabic line can be stored in a"
-    echo "  different digit order than it is printed (a right-to-left problem, not a model"
-    echo "  problem). Searching for the correct number may not find that document."
-    echo "  No setting fixes this. Search for both orders. Details are in the README."
-    echo
-    echo "${GREEN}═══════════════════════════════════════════${NC}"
-    echo "${GREEN}${BOLD}Thank you for using my script!${NC}"
-    echo "${GREEN}Subscribe for more AI guides:${NC}"
-    echo "${CYAN}YouTube: https://youtube.com/@malkhatib${NC}"
-    echo "${GREEN}═══════════════════════════════════════════${NC}"
-    echo
-
-    # A copy of the summary, without any password in it.
-    cat > "$SCRIPT_DIR/INSTALLATION_INFO.txt" <<EOF
-Paperless Arabic Stack — installed $(date -Iseconds)
-Installer version: $SCRIPT_VERSION
-Directory:         $SCRIPT_DIR
-
-Target:            $PAS_TARGET
-Archive URL:       $docs_url
-AI URL:            ${ai_url:-not installed}
-AI mode:           $PAS_AI_MODE
-Text model:        ${PAS_TEXT_MODEL:-none}
-Vision model:      ${PAS_VISION_MODEL:-none}
-GPU:               $PAS_GPU
-OCR language:      $PAS_OCR_LANGUAGE
-Timezone:          $PAS_TZ
-Admin username:    $PAS_ADMIN_USER
-
-Image versions (pinned):
-  paperless-ngx  $PAS_V_NGX
-  paperless-gpt  $PAS_V_GPT
-  ollama         $PAS_V_OLLAMA
-  postgres       $PAS_V_POSTGRES
-  valkey         $PAS_V_VALKEY
-  gotenberg      $PAS_V_GOTENBERG
-  tika           $PAS_V_TIKA
-  traefik        $PAS_V_TRAEFIK
-
-Passwords are NOT in this file. They are in ./.env (chmod 600).
-
-Commands: ./install.sh status | update | backup | restore <file> | uninstall
-EOF
-    print_success "A copy of this summary (without passwords) is in INSTALLATION_INFO.txt"
-}
+summary() { auth_summary; }
 
 ################################################################################
 # install
@@ -1883,12 +1566,20 @@ cmd_install() {
     fi
 
     precheck
+    # Snapshot existing data before changing routing, secrets or identity configuration.
+    if [[ -f $COMPOSE_FILE ]] && docker volume inspect "${COMPOSE_PROJECT}_pgdata" >/dev/null 2>&1; then
+        cmd_backup
+    fi
     ask_config
     write_env
+    auth_prepare
     write_compose
     write_prompts
     pull_images
+    auth_start
+    auth_provision
     start_core
+    auth_link_admin
     fetch_api_token
     create_trigger_tags
     pull_models
@@ -1948,32 +1639,20 @@ cmd_status() {
         # Guard first: `docker run -v name:/v` silently CREATES a missing volume,
         # so an unguarded size check litters the host with empty volumes.
         if docker volume inspect "$vol" >/dev/null 2>&1; then
-            sz=$(docker run --rm -v "${vol}:/v" docker.io/library/alpine:3 du -sh /v 2>/dev/null | awk '{print $1}')
+            sz=$(docker run --rm -v "${vol}:/v" docker.io/library/alpine:3.23.3 du -sh /v 2>/dev/null | awk '{print $1}')
         else
             sz="not created yet"
         fi
         printf '  %-10s %s\n' "$v" "${sz:-?}"
     done
     echo
-    print_step "Where it is"
-    if [[ ${PAS_TARGET} == vps ]]; then
-        echo "  Archive:  https://${PAS_DOCS_SUB}.${PAS_DOMAIN}"
-        [[ ${PAS_AI_MODE} != none ]] && echo "  AI:       https://${PAS_AI_SUB}.${PAS_DOMAIN}"
-        echo
-        print_step "Certificates"
-        if docker run --rm -v "${COMPOSE_PROJECT}_letsencrypt:/le" docker.io/library/alpine:3 \
-             sh -c 'test -s /le/acme.json' 2>/dev/null; then
-            print_success "acme.json exists (a certificate has been issued)"
-        else
-            print_warning "No certificate yet. docker compose logs traefik | grep -i acme"
-        fi
+    if [[ ${PAS_AUTH_ENABLED:-no} == yes ]]; then
+        python3 lib/auth_config.py urls
+        python3 lib/auth_verify.py
     else
-        local ip; ip=$(lan_ip)
-        echo "  Archive:  http://${ip:-127.0.0.1}:${PAS_HTTP_PORT}"
-        [[ ${PAS_AI_MODE} != none ]] && echo "  AI:       http://${PAS_GPT_BIND}:${PAS_GPT_PORT}"
+        print_warning "Legacy installation: run ./install.sh to migrate to HTTPS and Authentik."
     fi
-    echo
-    print_info "Passwords are in ./.env . Full summary: INSTALLATION_INFO.txt"
+
 }
 
 ################################################################################
@@ -1989,14 +1668,20 @@ cmd_update() {
     echo "To move to a newer release, change the PAS_V_* value in .env and run this again."
     echo
     print_step "Taking a safety backup of the database first..."
-    backup_db_only || print_warning "Could not back up the database. Continuing anyway."
+    cmd_backup
+    auth_prepare
+    write_compose
     print_step "Pulling images..."
     dc pull
     print_step "Restarting..."
     dc up -d --remove-orphans
     sleep 5
     dc ps
-    print_success "Update finished"
+    auth_start
+    auth_provision
+    auth_link_admin
+    verify
+    print_success "Update finished and verified"
     print_info "If something broke: ./install.sh restore backups/<newest file>"
 }
 
@@ -2021,6 +1706,9 @@ dump_db_to() {
         rm -f "$f"; return 1
     fi
     [[ -s $f ]] || { rm -f "$f"; return 1; }
+    gzip -t "$f" || return 1
+    local tail; tail=$(gzip -dc "$f" | tail -20)
+    contains "$tail" 'PostgreSQL database dump complete' || return 1
     chmod 600 "$f"
 }
 
@@ -2035,6 +1723,8 @@ cmd_backup() {
     require_installed
     print_header "Backup"
     mkdir -p "$BACKUP_DIR"
+    chmod 700 "$BACKUP_DIR"
+    auth_quiesce
     local stamp; stamp=$(date +%Y%m%d-%H%M%S)
     local work; work=$(mktemp -d "$BACKUP_DIR/.work-XXXXXX")
     local out="$BACKUP_DIR/paperless-ar-backup-${stamp}.tar.gz"
@@ -2054,28 +1744,31 @@ cmd_backup() {
     local v
     for v in media data; do
         docker run --rm -v "${COMPOSE_PROJECT}_${v}:/src:ro" -v "$work:/dst" \
-            docker.io/library/alpine:3 tar czf "/dst/${v}.tar.gz" -C /src . \
+            docker.io/library/alpine:3.23.3 tar czf "/dst/${v}.tar.gz" -C /src . \
             || { rm -rf "$work"; die "Could not archive the '$v' volume."; }
         print_success "${v}.tar.gz ($(du -h "$work/${v}.tar.gz" | cut -f1))"
     done
 
     print_step "3/4 Prompts, config and settings..."
     local -a extras=() item
-    for item in prompts config db export compose.yaml .env INSTALLATION_INFO.txt; do
+    for item in prompts config db export compose.yaml .env INSTALLATION_INFO.txt auth lib PAPERLESS-LOCAL-CA.crt; do
         [[ -e "$SCRIPT_DIR/$item" ]] && extras+=("$item")
     done
     tar czf "$work/files.tar.gz" -C "$SCRIPT_DIR" "${extras[@]}"
     print_success "files.tar.gz ($(du -h "$work/files.tar.gz" | cut -f1))"
 
+    auth_backup "$work"
     print_step "4/4 Packing..."
     # documents= is load-bearing: restore compares it with what actually landed
     # in the database, which is how a half-applied dump gets caught.
     printf 'paperless-arabic-stack backup\ncreated=%s\ninstaller=%s\npaperless_ngx=%s\npaperless_gpt=%s\npostgres=%s\ndocuments=%s\n' \
         "$(date -Iseconds)" "$SCRIPT_VERSION" "$PAS_V_NGX" "${PAS_V_GPT:-none}" "$PAS_V_POSTGRES" "${docs:-unknown}" > "$work/MANIFEST"
-    tar czf "$out" -C "$work" MANIFEST db.sql.gz media.tar.gz data.tar.gz files.tar.gz
+    tar czf "$out" -C "$work" .
+    tar tzf "$out" >/dev/null || die "Backup archive verification failed."
     chmod 600 "$out"
     rm -rf "$work"
 
+    auth_resume
     print_success "Backup ready: $out  ($(du -h "$out" | cut -f1))"
     echo
     print_warning "This archive contains .env, which contains ALL your passwords."
@@ -2094,7 +1787,7 @@ cmd_restore() {
     print_header "Restore"
     print_warning "This REPLACES the current database and all documents with the backup."
     echo "  Backup file: $src"
-    tar xzf "$src" -O MANIFEST 2>/dev/null | sed 's/^/    /' || true
+    tar xzf "$src" -O ./MANIFEST 2>/dev/null | sed 's/^/    /' || true
     echo
     if ! (( NONINTERACTIVE )); then
         local ans=""
@@ -2103,7 +1796,7 @@ cmd_restore() {
     fi
 
     local work; work=$(mktemp -d)
-    tar xzf "$src" -C "$work" || { rm -rf "$work"; die "Could not read the backup archive."; }
+    python3 lib/backup_check.py "$src" "$work" || { rm -rf "$work"; die "Could not read the backup archive."; }
     [[ -f $work/db.sql.gz ]] || { rm -rf "$work"; die "There is no database dump (db.sql.gz) inside that archive."; }
 
     # Everything below is checked BEFORE the live database is dropped. Restore is
@@ -2125,6 +1818,7 @@ cmd_restore() {
     local want_docs; want_docs=$(sed -n 's/^documents=//p' "$work/MANIFEST" 2>/dev/null | tr -dc '0-9' || true)
     print_success "Backup file is complete${want_docs:+ (${want_docs} documents in it)}"
 
+    auth_restore_preflight "$work"
     print_step "Stopping the applications (the database stays up)..."
     dc stop webserver paperless-gpt 2>/dev/null || true
 
@@ -2232,12 +1926,13 @@ cmd_restore() {
 
     print_success "Database restored (${got_docs} documents, ${got_users} users) — checked, not assumed"
 
+    auth_restore "$work"
     print_step "Restoring your documents..."
     local v
     for v in media data; do
         [[ -f "$work/${v}.tar.gz" ]] || continue
         docker run --rm -v "${COMPOSE_PROJECT}_${v}:/dst" -v "$work:/src:ro" \
-            docker.io/library/alpine:3 sh -c "rm -rf /dst/* /dst/.[!.]* 2>/dev/null; tar xzf /src/${v}.tar.gz -C /dst"
+            docker.io/library/alpine:3.23.3 sh -c "rm -rf /dst/* /dst/.[!.]* 2>/dev/null; tar xzf /src/${v}.tar.gz -C /dst"
         print_success "${v} restored"
     done
 
@@ -2251,6 +1946,10 @@ cmd_restore() {
     reconcile_identity
     sleep 5
     dc ps
+    auth_start
+    auth_provision
+    auth_link_admin
+    verify
     print_success "Restore finished. Open your archive and check a document opens."
     if [[ -n $safety ]]; then
         print_info "The database you replaced is still saved here, delete it when you are happy:"
@@ -2505,6 +2204,7 @@ Paperless Arabic Stack — installer $SCRIPT_VERSION
   ./install.sh backup          DB + documents + prompts/config -> ./backups
   ./install.sh restore <file>  restore from a backup archive
   ./install.sh uninstall       stop the stack (your documents are kept)
+  ./install.sh auth-recover    create a private, time-limited Authentik recovery link
   ./install.sh help            this text
 
 Options:
@@ -2528,6 +2228,10 @@ EOF
 }
 
 main() {
+    if command_exists flock; then
+        exec 9>"$SCRIPT_DIR/.installer.lock"
+        flock -n 9 || die "Another installer operation is active in this directory."
+    fi
     local cmd="" purge=0
     local -a pos=()
     # Flags are accepted in ANY position. The first version stopped scanning at
@@ -2551,6 +2255,7 @@ main() {
         install)   cmd_install ;;
         status)    cmd_status ;;
         update)    cmd_update ;;
+        auth-recover) require_installed; auth_recover ;;
         backup)    cmd_backup ;;
         restore)   cmd_restore "${pos[0]:-}" ;;
         uninstall)
@@ -2580,4 +2285,5 @@ main() {
     esac
 }
 
-main "$@"
+source "$SCRIPT_DIR/lib/auth.sh"
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then main "$@"; fi
